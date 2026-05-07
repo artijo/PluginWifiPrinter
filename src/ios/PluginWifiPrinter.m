@@ -1,10 +1,37 @@
 #import "PluginWifiPrinter.h"
+#import "POSPrinterSDK.h"
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+
+/** Temporary delegate to await Xprinter LAN connect. */
+@interface DeltafoodXprinterWifiGate : NSObject <POSWIFIManagerDelegate>
+@property (nonatomic) dispatch_semaphore_t connectSem;
+@property (nonatomic, assign) BOOL didSignal;
+@property (nonatomic, assign) BOOL didConnect;
+@end
+
+@implementation DeltafoodXprinterWifiGate
+
+- (void)POSwifiConnectedToHost:(NSString *)host port:(UInt16)port {
+    self.didConnect = YES;
+    if (!self.didSignal && self.connectSem) {
+        self.didSignal = YES;
+        dispatch_semaphore_signal(self.connectSem);
+    }
+}
+
+- (void)POSwifiDisconnectWithError:(NSError *)error {
+    if (!self.didConnect && !self.didSignal && self.connectSem) {
+        self.didSignal = YES;
+        dispatch_semaphore_signal(self.connectSem);
+    }
+}
+
+@end
 
 @implementation PluginWifiPrinter
 
@@ -48,15 +75,131 @@
 }
 
 - (void)printBase64ImageToXprinter:(CDVInvokedUrlCommand*)command {
-    NSString* ipAndPort = [command.arguments objectAtIndex:0];
-    NSString* base64String = [command.arguments objectAtIndex:1];
-    
+    NSString *ipAndPort = [command.arguments objectAtIndex:0];
+    NSString *base64String = [command.arguments objectAtIndex:1];
+
+    CGFloat paperWidth = 576.f;
+    if (command.arguments.count > 2) {
+        NSObject *pw = [command.arguments objectAtIndex:2];
+        if ([pw respondsToSelector:@selector(floatValue)]) {
+            paperWidth = [(NSNumber*)pw floatValue];
+        }
+        if (paperWidth <= 0) {
+            paperWidth = 576.f;
+        }
+    }
+
     if (ipAndPort == nil || base64String == nil || [ipAndPort length] == 0 || [base64String length] == 0) {
         [self sendError:@"IP หรือ Base64 ว่าง" command:command];
         return;
     }
 
-    // 🌟 แยก IP และ Port
+    NSString *host = ipAndPort;
+    UInt16 port = 9100;
+    NSRange colon = [ipAndPort rangeOfString:@":" options:NSBackwardsSearch];
+    if (colon.location != NSNotFound && colon.location + 1 < [ipAndPort length]) {
+        NSString *maybePort =
+            [[ipAndPort substringFromIndex:colon.location + 1]
+             stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+        if ([maybePort length] > 0 && [maybePort rangeOfCharacterFromSet:nonDigits].location == NSNotFound) {
+            port = (UInt16)[maybePort intValue];
+            host = [[ipAndPort substringToIndex:colon.location]
+                    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        }
+    }
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        POSWIFIManager *wifi = [POSWIFIManager sharedInstance];
+        id<POSWIFIManagerDelegate> previousDelegate = wifi.delegate;
+
+        NSData *imageData =
+            [[NSData alloc] initWithBase64EncodedString:base64String
+                                                options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        if (imageData == nil) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self sendError:@"ไม่สามารถแปลง Base64 เป็น NSData ได้" command:command];
+            });
+            return;
+        }
+        UIImage *image = [UIImage imageWithData:imageData];
+        if (image == nil) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self sendError:@"ไม่สามารถแปลง NSData เป็น UIImage ได้" command:command];
+            });
+            return;
+        }
+
+        UIImage *processedImage = [self resizeImage:image maxWidth:paperWidth];
+        UIImage *bwImage = [self convertToBlackAndWhite:processedImage];
+
+        DeltafoodXprinterWifiGate *gate = [DeltafoodXprinterWifiGate new];
+        gate.connectSem = dispatch_semaphore_create(0);
+        wifi.delegate = gate;
+
+        [wifi disconnect];
+        [NSThread sleepForTimeInterval:0.06];
+        gate.didConnect = NO;
+        gate.didSignal = NO;
+
+        dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC));
+        NSString *failureReason = @"เชื่อมต่อเครื่องพิมพ์ไม่สำเร็จ";
+
+        BOOL connected = NO;
+        [wifi connectWithHost:host port:port];
+        if (dispatch_semaphore_wait(gate.connectSem, deadline) == 0 && gate.didConnect) {
+            connected = [wifi printerIsConnect] || wifi.isConnect;
+        }
+        wifi.delegate = previousDelegate;
+
+        if (!connected) {
+            [wifi disconnect];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self sendError:failureReason command:command];
+            });
+            return;
+        }
+
+        NSMutableData *dataM = [NSMutableData dataWithData:[POSCommand initializePrinter]];
+        [dataM appendData:[POSCommand selectAlignment:POS_ALIGNMENT_CENTER]];
+        [dataM appendData:[POSCommand printRasteBmpWithM:RasterNolmorWH
+                                                andImage:bwImage
+                                                 andType:Dithering]];
+        [dataM appendData:[POSCommand printAndFeedForwardWhitN:6]];
+        [dataM appendData:[POSCommand selectCutPageModelAndCutpage:1]];
+
+        dispatch_semaphore_t writeSem = dispatch_semaphore_create(0);
+        __block BOOL writeOk = NO;
+        [wifi writeCommandWithData:dataM
+                    writeCallBack:^(BOOL success, NSError *error) {
+                        writeOk = success;
+                        if (!success && error != nil) {
+                            NSLog(@"PluginWifiPrinter Xprinter write error: %@", error);
+                        }
+                        dispatch_semaphore_signal(writeSem);
+                    }];
+
+        dispatch_time_t wDeadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120.0 * NSEC_PER_SEC));
+        dispatch_semaphore_wait(writeSem, wDeadline);
+        [wifi disconnect];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (writeOk) {
+                [self sendSuccess:@"1" command:command];
+            } else {
+                [self sendError:@"พิมพ์ผ่าน Xprinter SDK ล้มเหลว" command:command];
+            }
+        });
+    });
+}
+
+- (void)openCashDrawer:(CDVInvokedUrlCommand*)command {
+    NSString* ipAndPort = [command.arguments objectAtIndex:0];
+    if (ipAndPort == nil || [ipAndPort length] == 0) {
+        [self sendError:@"ไม่มี IP หรือ Port" command:command];
+        return;
+    }
+
     NSString *ip = ipAndPort;
     int port = 9100;
     NSArray *parts = [ipAndPort componentsSeparatedByString:@":"];
@@ -66,78 +209,28 @@
     }
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSData *imageData = [[NSData alloc] initWithBase64EncodedString:base64String options:NSDataBase64DecodingIgnoreUnknownCharacters];
-        if (imageData == nil) {
-            [self sendError:@"ไม่สามารถแปลง Base64 เป็น NSData ได้" command:command];
-            return;
-        }
-        UIImage *image = [UIImage imageWithData:imageData];
-        if (image == nil) {
-            [self sendError:@"ไม่สามารถแปลง NSData เป็น UIImage ได้" command:command];
-            return;
-        }
-
-        UIImage *processedImage = [self resizeImage:image maxWidth:576];
-        UIImage *bwImage = [self convertToBlackAndWhite:processedImage];
-
         int sock = [self connectToPrinter:ip port:port];
         if (sock < 0) {
             [self sendError:@"เชื่อมต่อเครื่องพิมพ์ไม่สำเร็จ" command:command];
             return;
         }
 
-        NSArray<UIImage*> *chunks = [self splitImage:bwImage maxHeight:500]; // แบ่งเป็น 500px ต่อส่วน
-        BOOL allSent = YES;
+        // ESC p m t1 t2 - เปิดลิ้นชักเก็บเงิน (pin 2)
+        const uint8_t openDrawerCmd[] = {0x1B, 0x70, 0x00, 0x19, 0xFA};
+        ssize_t sent = send(sock, openDrawerCmd, sizeof(openDrawerCmd), 0);
+        close(sock);
 
-        for (UIImage *chunk in chunks) {
-            BOOL sent = NO;
-            for (int attempt = 1; attempt <= 3; attempt++) {
-                if ([self sendImageAsRasterChunk:chunk socket:sock]) {
-                    sent = YES;
-                    break;
-                } else {
-                    NSLog(@"⚠️ ส่ง chunk ล้มเหลว (ครั้งที่ %d) รอแล้วลองใหม่", attempt);
-                    [NSThread sleepForTimeInterval:1.0];
-                }
-            }
-
-            if (!sent) {
-                allSent = NO;
-                break;
-            }
-        }
-
-        if (allSent) {
-            NSLog(@"⏳ รอสถานะเครื่องพิมพ์จนกว่าจะพร้อม…");
-            BOOL printerReady = NO;
-            int retry = 0, maxRetry = 60;
-
-            while (retry++ < maxRetry) {
-                if ([self waitForPrinterReady:sock timeout:1000]) {
-                    printerReady = YES;
-                    break;
-                } else {
-                    NSLog(@"⏳ เครื่องพิมพ์ยังไม่พร้อม (ครั้งที่ %d/%d)", retry, maxRetry);
-                    [NSThread sleepForTimeInterval:1.0];
-                }
-            }
-
-            if (printerReady) {
-                [self cutPaper:sock];
-                close(sock);
-                [self sendSuccess:@"✅ พิมพ์สำเร็จและตัดกระดาษแล้ว" command:command];
-            } else {
-                [self cutPaper:sock];
-                close(sock);
-                [self sendError:@"⚠️ เครื่องพิมพ์ไม่ตอบสนองหลังรอนานเกินไป" command:command];
-            }
-
+        if (sent == sizeof(openDrawerCmd)) {
+            [self sendSuccess:@"✅ เปิดลิ้นชักเก็บเงินสำเร็จ" command:command];
         } else {
-            close(sock);
-            [self sendError:@"พิมพ์บางส่วนล้มเหลว" command:command];
+            [self sendError:@"เปิดลิ้นชักเก็บเงินล้มเหลว" command:command];
         }
     });
 }
+// - (void)openDrawer:(CDVInvokedUrlCommand*)command {
+// -    const uint8_t openDrawerCmd[] = {0x1B, 0x70, 0x00, 0x19, 0xFA};
+// -    send(sock, openDrawerCmd, sizeof(openDrawerCmd), 0);
+// -}
 
 
 - (void)clearPrinterQueue:(CDVInvokedUrlCommand*)command {
@@ -413,10 +506,26 @@
 
 }
 
-/// ตัดกระดาษ
+/// ตัดกระดาษ — feed 5 lines ก่อนแล้ว partial cut
 - (void)cutPaper:(int)sock {
-    const uint8_t cutCmd[] = {0x1D, 0x56, 0x41, 0x10};
+    // ESC d 5: feed 5 lines เพื่อให้กระดาษออกมาพอตัด
+    const uint8_t feedCmd[] = {0x1B, 0x64, 0x05};
+    send(sock, feedCmd, sizeof(feedCmd), 0);
+    // GS V 1: partial cut (0x01 = most XPrinter models support this)
+    const uint8_t cutCmd[] = {0x1D, 0x56, 0x01};
     send(sock, cutCmd, sizeof(cutCmd), 0);
+}
+
+/// ปิด socket อย่างปลอดภัย — รอให้ TCP kernel flush buffer ก่อน
+/// send() เป็น non-blocking: data อยู่ใน kernel buffer แต่ยังไม่ส่งออก
+/// close() ทันทีทำให้ iOS อาจส่ง TCP RST ก่อน cut bytes ถึงเครื่องพิมพ์ (intermittent ไม่ตัด)
+/// SO_LINGER: บังคับให้ close() block จนกว่า TCP จะ ACK ทุก byte หรือ timeout (3 วินาที)
+- (void)flushAndClose:(int)sock {
+    struct linger lingerOpt;
+    lingerOpt.l_onoff = 1;
+    lingerOpt.l_linger = 3; // รอสูงสุด 3 วินาที
+    setsockopt(sock, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
+    close(sock);
 }
 
 /// แบ่ง UIImage ออกเป็นหลายส่วน สูงสุดสูงละ maxHeight px

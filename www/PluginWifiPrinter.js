@@ -61,10 +61,38 @@ exports.printTestXprinter = function (ip, success, error) {
 };
 
 // พิมพ์ข้อความ base64 ไปยัง Xprinter
-exports.printBase64ImageToXprinter = function (ip, base64Data, success, error) {
-  console.log('printBase64ImageToXprinter called with IP:', ip);
+// รองรับสองแบบ:
+//   (ip, base64, success, error) — เก่า ไม่ส่งความกว้าง → native ใช้ default 576
+//   (ip, base64, paperWidth, success, error) — ที่ Angular ใช้ (58mm=384, 80mm=576)
+exports.printBase64ImageToXprinter = function (ip, base64Data, arg3, arg4, arg5) {
+  var paperWidth = 576;
+  var success;
+  var errorCb;
 
-  exec(success, error, 'PluginWifiPrinter', 'printBase64ImageToXprinter', [ip, base64Data]);
+  if (typeof arg3 === 'function') {
+    success = arg3;
+    errorCb = arg4;
+  } else {
+    var w = arg3 != null && arg3 !== '' ? Number(arg3) : 576;
+    paperWidth = isNaN(w) || w <= 0 ? 576 : w;
+    success = arg4;
+    errorCb = arg5;
+  }
+
+  console.log(
+    'printBase64ImageToXprinter called IP:',
+    ip,
+    'paperWidth:',
+    paperWidth
+  );
+
+  exec(
+    success,
+    errorCb,
+    'PluginWifiPrinter',
+    'printBase64ImageToXprinter',
+    [ip, base64Data, paperWidth]
+  );
 };
 
 // ฟังก์ชันส่งข้อความเป็นภาพไปพิมพ์
@@ -88,4 +116,26 @@ exports.clearPrinterQueue = function (ip, success, error) {
   exec(success, error, 'PluginWifiPrinter', 'clearPrinterQueue', [ip]);
 };
 
+
+exports.openCashDrawer = function (ip, success, error) {
+  console.log('openCashDrawer called with IP:', ip);
+
+  exec(success, error, 'PluginWifiPrinter', 'openCashDrawer', [ip]);
+};
+
+// พิมพ์ Bitmap (Base64) ผ่าน SPI bus เช่น /dev/spidev0.0
+//   spiDevicePath : path ของ SPI character device (default: '/dev/spidev0.0')
+//   base64Data    : ข้อมูลรูปภาพ Base64 (ไม่ต้องมี data:image/...)
+//   paperWidth    : ความกว้างกระดาษเป็น px (default 384 = 58mm, ใช้ 576 สำหรับ 80mm)
+exports.printBitmapToSpi = function (spiDevicePath, base64Data, paperWidth, success, error) {
+  console.log('printBitmapToSpi called with device:', spiDevicePath, 'width:', paperWidth);
+
+  exec(
+    success,
+    error,
+    'PluginWifiPrinter',
+    'printBitmapToSpi',
+    [spiDevicePath || '/dev/spidev0.0', base64Data, paperWidth || 384]
+  );
+};
 

@@ -10,5 +10,6 @@
 - (BOOL)sendImageAsRasterChunk:(UIImage*)image socket:(int)sock;
 
 - (void)checkIpWithPort:(CDVInvokedUrlCommand*)command;
+- (void)openCashDrawer:(CDVInvokedUrlCommand*)command;
 
 @end

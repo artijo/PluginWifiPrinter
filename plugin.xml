@@ -27,6 +27,9 @@
             <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
         </config-file>
 
+        <resource-file src="src/android/libs/printer-lib-3.2.0.aar" target="libs/printer-lib-3.2.0.aar" />
+        <framework src="src/android/printer-sdk.gradle" custom="true" type="gradleReference" />
+
         <source-file src="src/android/PluginWifiPrinter.java" target-dir="src/com/yourcompany/pluginwifiprinter" />
     </platform>
 
@@ -38,8 +41,30 @@
             </feature>
         </config-file>
 
-        <source-file src="src/ios/PluginWifiPrinter.h" />
+        <!-- Xprinter iOS PrinterSDK v2.3.0 (TCP/LAN POS) -->
+        <header-file src="src/ios/XprinterSDK/Headers/POSPrinterSDK.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/POSWIFIManager.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/POSBLEManager.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/POSCommand.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/POSPrinter.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/POSImageTranster.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/PrinterProfile.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/PTable.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/WIFIConnecter.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/CPCLCommand.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/ZPLCommand.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/KDS_Log.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/TSCBLEManager.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/TSCCommand.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/TSCPrinterSDK.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/TSCWIFIManager.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/LabelDocument.h" />
+        <header-file src="src/ios/XprinterSDK/Headers/LabelImageTranster.h" />
+        <framework src="src/ios/XprinterSDK/libPrinterSDK.a" custom="true" />
+
+        <header-file src="src/ios/PluginWifiPrinter.h" />
         <source-file src="src/ios/PluginWifiPrinter.m" />
+
     </platform>
 
 </plugin>

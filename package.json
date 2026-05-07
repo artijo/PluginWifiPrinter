@@ -5,7 +5,8 @@
   "cordova": {
     "id": "com.yourcompany.pluginwifiprinter",
     "platforms": [
-      "android"
+      "android",
+      "ios"
     ]
   },
   "keywords": [
