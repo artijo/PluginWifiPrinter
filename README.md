@@ -4,7 +4,7 @@ Cordova Plugin สำหรับพิมพ์ผ่าน Wi-Fi Printer
 
 ### Install
 ```bash
-ionic cordova plugin add https://github.com/PreeDeer/pluginwifiprinter.git
+ionic cordova plugin add https://github.com/artijo/pluginwifiprinter.git
 
 ### remove
 ionic cordova plugin remove com.yourcompany.pluginwifiprinter
