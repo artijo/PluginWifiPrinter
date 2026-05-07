@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<plugin 
+    id="com.yourcompany.pluginwifiprinter" 
+    version="1.0.0" 
+    xmlns="http://apache.org/cordova/ns/plugins/1.0"
+    xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <name>PluginWifiPrinter</name>
+
+    <!-- JS Bridge -->
+    <js-module name="PluginWifiPrinter" src="www/PluginWifiPrinter.js">
+        <clobbers target="cordova.plugins.PluginWifiPrinter" />
+    </js-module>
+
+    <!-- Android -->
+    <platform name="android">
+        <config-file target="res/xml/config.xml" parent="/*">
+            <feature name="PluginWifiPrinter">
+                <param name="android-package" value="com.yourcompany.pluginwifiprinter.PluginWifiPrinter" />
+            </feature>
+        </config-file>
+
+        <config-file target="AndroidManifest.xml" parent="/*">
+            <uses-permission android:name="android.permission.INTERNET" />
+            <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+            <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+            <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+        </config-file>
+
+        <source-file src="src/android/PluginWifiPrinter.java" target-dir="src/com/yourcompany/pluginwifiprinter" />
+    </platform>
+
+    <!-- iOS -->
+    <platform name="ios">
+        <config-file target="config.xml" parent="/*">
+            <feature name="PluginWifiPrinter">
+                <param name="ios-package" value="PluginWifiPrinter" />
+            </feature>
+        </config-file>
+
+        <source-file src="src/ios/PluginWifiPrinter.h" />
+        <source-file src="src/ios/PluginWifiPrinter.m" />
+    </platform>
+
+</plugin>
+
+<!-- <?xml version='1.0' encoding='utf-8'?>
+<plugin id="com.yourcompany.pluginwifiprinter" version="1.0.0" xmlns="http://apache.org/cordova/ns/plugins/1.0" xmlns:android="http://schemas.android.com/apk/res/android"><name>PluginWifiPrinter</name><js-module name="PluginWifiPrinter" src="www/PluginWifiPrinter.js"><clobbers target="cordova.plugins.PluginWifiPrinter" /></js-module><platform name="android"><config-file parent="/*" target="res/xml/config.xml"><feature name="PluginWifiPrinter"><param name="android-package" value="com.yourcompany.pluginwifiprinter.PluginWifiPrinter" /></feature></config-file><config-file parent="/*" target="AndroidManifest.xml"><uses-permission android:name="android.permission.INTERNET" /><uses-permission android:name="android.permission.ACCESS_WIFI_STATE" /><uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" /><uses-permission android:name="android.permission.CHANGE_WIFI_STATE" /></config-file><source-file src="src/android/PluginWifiPrinter.java" target-dir="com/yourcompany/pluginwifiprinter" /></platform><platform name="ios"><config-file parent="/*" target="config.xml"><feature name="PluginWifiPrinter"><param name="ios-package" value="PluginWifiPrinter" /></feature></config-file><source-file src="src/ios/PluginWifiPrinter.m" /></platform></plugin> -->
