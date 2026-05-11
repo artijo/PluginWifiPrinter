@@ -452,6 +452,29 @@ public class PluginWifiPrinter extends CordovaPlugin {
                             .feedLine(3)
                             .cutHalfAndFeed(1);
 
+                    // ===== หลังบรรทัดนี้ถือว่าข้อมูลถูก queue ไปฝั่ง SDK แล้ว =====
+                    // Xprinter POS SDK เป็น async — printBitmap/cutHalfAndFeed แค่ enqueue command
+                    // จาก scenario นี้:
+                    //  - ถ้าเรา error หลังจุดนี้ → JS retry → พิมพ์เบิ้ลซ้ำ
+                    //  - ถ้าเรารีบ success โดยไม่ flush → ปิด socket เร็วเกิน → พิมพ์ขาด
+                    // ดังนั้น: รอ flush ก่อน แล้ว "ตอบ success เสมอ" หลังจุดนี้ (close error → log warn เท่านั้น)
+                    try {
+                        // เผื่อเวลาให้ SDK ส่งข้อมูลออกจาก buffer
+                        // (Xprinter/EPSON LAN บิตแมปขนาดทั่วไป ส่ง ~200-400ms)
+                        Thread.sleep(500);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                    }
+
+                    try {
+                        conn.closeSync();
+                    } catch (Exception closeEx) {
+                        // ปิด socket throw หลังข้อมูลส่งไปแล้ว — ไม่ใช่ error ที่ผู้ใช้ต้องเห็น
+                        Log.w(TAG, "closeSync warning (data already sent): " + closeEx.getMessage());
+                    } finally {
+                        conn = null; // กัน finally ด้านนอกปิดซ้ำ
+                    }
+
                     callbackContext.success("1");
                 } catch (Exception e) {
                     Log.e(TAG, "❌ Print error (Xprinter SDK): " + e.getMessage(), e);
