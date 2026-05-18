@@ -57,6 +57,26 @@ public class PluginWifiPrinter extends CordovaPlugin {
     // ใหม่ 25/2/2026
     private static final Map<String, Object> printerLocks = new ConcurrentHashMap<>();
 
+    /**
+     * ePOS2 เปิด USB ได้ทีละ session — ถ้าใช้ล็อกตาม target คนละคีย์ระหว่าง "USB:" กับ "USB:/dev/..."
+     * งานจะซ้อนกันแล้ว connect ได้ ERR_ILLEGAL / ERR_IN_USE
+     */
+    private static final Object EPSON_USB_GLOBAL_LOCK = new Object();
+
+    /**
+     * target ที่ Printer.connect สำเร็จล่าสุด (ต่อ process) — ลดรอบ Discovery และไม่ย่อเป็นแค่ "USB:"
+     * เมื่อ Discovery คืน USB:/dev/... แต่ normalize เดิมทำให้กลายเป็น USB: แล้ว connect ช้า/ล้ม
+     */
+    private static volatile String sLastGoodEpsonUsbConnectTarget;
+
+    /**
+     * Persistent Epson USB Printer instance — เก็บ connection ไว้ข้าม job
+     * แก้ปัญหา TM-T82II ERR_CONNECT ครั้งที่ 2+ (USB handle ยังค้างหลัง disconnect)
+     */
+    private static volatile Printer sEpsonUsbPrinterInstance = null;
+    private static volatile String  sEpsonUsbPrinterTarget   = null;
+    private static volatile int     sEpsonUsbPrinterSeries   = -1;
+
     private volatile boolean posSdkInited;
 
     private static final IConnectListener EMPTY_POS_LISTENER =
@@ -110,10 +130,22 @@ public class PluginWifiPrinter extends CordovaPlugin {
         return new String[]{host, Integer.toString(port)};
     }
 
+    /**
+     * Epson ePOS2 ต้องการ Application context ตามเอกสาร — ห้ามส่ง Activity เข้า Printer
+     */
+    private Context getAppCtxForEpson() {
+        Activity a = cordova.getActivity();
+        if (a != null) {
+            return a.getApplicationContext();
+        }
+        Context c = cordova.getContext();
+        return c != null ? c.getApplicationContext() : null;
+    }
+
     @Override
     public void pluginInitialize() {
         super.pluginInitialize();
-        ensurePosSdkInit();
+        // ห้าม ensurePosSdkInit() ที่นี่ — Xprinter POSConnect แย่ง USB กับ ePOS2 ทำให้พิมพ์ Epson รอบสองได้ ERR_CONNECT
     }
 
     @Override
@@ -660,7 +692,7 @@ public class PluginWifiPrinter extends CordovaPlugin {
     //         }
     //     }).start();
     // }
-    
+
     /*----------------------------------------------------------------------- */
 
     private void printTextAsImage(String ip, String text, CallbackContext callbackContext) {
@@ -1150,7 +1182,18 @@ public class PluginWifiPrinter extends CordovaPlugin {
             try {
                 Context ctx = cordova.getActivity().getApplicationContext();
 
-                // --- Xprinter side --------------------------------------------------
+                // --- Epson ก่อน (ลดโอกาส POSConnect จับ USB ก่อน ePOS2) ---
+                if ("epson".equals(wanted) || "all".equals(wanted) || "auto".equals(wanted)) {
+                    try {
+                        List<JSONObject> found = epsonDiscoverUsb(ctx);
+                        for (JSONObject o : found) {
+                            printers.put(o);
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "Epson listUsb failed: " + t.getMessage());
+                    }
+                }
+
                 if ("xprinter".equals(wanted) || "all".equals(wanted) || "auto".equals(wanted)) {
                     try {
                         ensurePosSdkInit();
@@ -1159,7 +1202,6 @@ public class PluginWifiPrinter extends CordovaPlugin {
                             for (UsbDevice d : xpDevices) {
                                 JSONObject o = new JSONObject();
                                 o.put("brand", "xprinter");
-                                // Xprinter SDK ใช้ devicePath/deviceName เป็น target string ของ connectSync
                                 String target = d.getDeviceName();
                                 o.put("target", target);
                                 o.put("deviceName", target);
@@ -1175,18 +1217,6 @@ public class PluginWifiPrinter extends CordovaPlugin {
                         }
                     } catch (Throwable t) {
                         Log.w(TAG, "Xprinter listUsb failed: " + t.getMessage());
-                    }
-                }
-
-                // --- Epson side -----------------------------------------------------
-                if ("epson".equals(wanted) || "all".equals(wanted) || "auto".equals(wanted)) {
-                    try {
-                        List<JSONObject> found = epsonDiscoverUsb(ctx);
-                        for (JSONObject o : found) {
-                            printers.put(o);
-                        }
-                    } catch (Throwable t) {
-                        Log.w(TAG, "Epson listUsb failed: " + t.getMessage());
                     }
                 }
 
@@ -1214,6 +1244,364 @@ public class PluginWifiPrinter extends CordovaPlugin {
         return "";
     }
 
+    /** หน่วงเวลาแบบไม่ throw — หลัง sendData USB ให้เฟิร์มแวร์ระบายก่อน disconnect */
+    private static void sleepQuiet(long ms) {
+        if (ms <= 0) return;
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static int usbAttachedDeviceCount(Context ctx) {
+        if (ctx == null) return 0;
+        UsbManager um = (UsbManager) ctx.getSystemService(Context.USB_SERVICE);
+        if (um == null) return 0;
+        return um.getDeviceList().size();
+    }
+
+    /**
+     * แปลง target ที่ผู้ใช้/Epson ส่งมาให้ตรงกับ {@link UsbDevice#getDeviceName()} สำหรับค้นหาและขอสิทธิ์
+     * เช่น {@code USB:/dev/bus/usb/001/006} → {@code /dev/bus/usb/001/006}
+     */
+    private static String androidUsbPathForPermissionLookup(String target) {
+        if (target == null) return null;
+        String t = target.trim();
+        if (t.regionMatches(true, 0, "USB:", 0, 4)) {
+            String rest = t.length() > 4 ? t.substring(4).trim() : "";
+            if (rest.startsWith("/dev/")) {
+                return rest;
+            }
+            return null;
+        }
+        if (t.startsWith("/dev/bus/usb/") || t.startsWith("/dev/usb/")) {
+            return t;
+        }
+        return null;
+    }
+
+    /**
+     * ePOS2 ใช้ target จาก Discovery เช่น "USB:xxxxxxxx" หรือ "USB:" เมื่อมีเครื่อง USB Epson เดียว
+     * รูปแบบ "USB:/dev/bus/usb/..." ไม่ถูกต้อง
+     */
+    private static String normalizeEpsonUsbConnectTarget(String target) {
+        if (target == null) return "USB:";
+        String t = target.trim();
+        if (t.isEmpty()) return "USB:";
+        if (t.regionMatches(true, 0, "USB:", 0, 4)) {
+            String rest = t.length() > 4 ? t.substring(4).trim() : "";
+            if (rest.startsWith("/dev/")) {
+                Log.w(TAG, "Epson USB: USB:+Android dev path — using USB:");
+                return "USB:";
+            }
+        }
+        if (t.startsWith("/dev/bus/usb/") || t.startsWith("/dev/usb/")) {
+            Log.w(TAG, "Epson USB: bare Android dev path — using USB:");
+            return "USB:";
+        }
+        return t;
+    }
+
+    /**
+     * ปิด Epson USB ปลอดภัย — ห้าม clearCommandBuffer หลัง disconnect (TM-T82II พิมพ์รอบถัดไม่ได้)
+     */
+    private static void releaseEpsonPrinterUsb(Printer printer) {
+        if (printer == null) return;
+        try {
+            try {
+                printer.endTransaction();
+            } catch (Exception e) {
+                Log.w(TAG, "Epson USB endTransaction(release): " + e.getMessage());
+            }
+            try {
+                printer.clearCommandBuffer();
+            } catch (Exception e) {
+                Log.w(TAG, "Epson USB clearCommandBuffer(pre-disconnect): " + e.getMessage());
+            }
+            sleepQuiet(100);
+            try {
+                printer.disconnect();
+            } catch (Exception e) {
+                Log.w(TAG, "Epson USB disconnect: " + String.valueOf(e.getMessage()), e);
+            }
+            sleepQuiet(650);
+        } catch (Throwable t) {
+            Log.w(TAG, "Epson USB release cleanup: " + t.getMessage());
+        }
+    }
+
+    /** connect ล้มเหลว — ไม่เรียก endTransaction/clear (ลด ERR_ILLEGAL รอบถัดไป + ไม่ spam disconnect) */
+    private static void abandonEpsonPrinterUsb(Printer printer) {
+        if (printer == null) return;
+        try {
+            printer.disconnect();
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * ล้าง persistent Epson USB printer — disconnect + ล้าง static fields
+     * เรียกเมื่อเกิด error ระหว่าง print หรือต้องการ reset การเชื่อมต่อ
+     */
+    private static void invalidateEpsonUsbPrinter() {
+        Printer p = sEpsonUsbPrinterInstance;
+        sEpsonUsbPrinterInstance = null;
+        sEpsonUsbPrinterTarget   = null;
+        sEpsonUsbPrinterSeries   = -1;
+        sLastGoodEpsonUsbConnectTarget = null;
+        if (p != null) {
+            try { p.clearCommandBuffer(); } catch (Throwable ignored) {}
+            try { p.disconnect();         } catch (Throwable ignored) {}
+            sleepQuiet(400);
+        }
+    }
+
+    /**
+     * คืน Epson USB Printer ที่ยังเชื่อมต่ออยู่ หรือสร้างใหม่ถ้าจำเป็น
+     * ไม่ disconnect ระหว่าง job เพื่อแก้ปัญหา TM-T82II ERR_CONNECT ครั้งที่ 2+
+     */
+    private static Printer getOrCreateEpsonUsbPrinter(int series, Context ctx, String target)
+            throws Epos2Exception {
+        // normalize: "USB:/dev/..." → "USB:"  (dev-path ไม่ใช่ Epson target จริง)
+        String tgtNorm = (target == null || target.trim().isEmpty()) ? "USB:" : target.trim();
+        if (tgtNorm.regionMatches(true, 0, "USB:", 0, 4)) {
+            String rest = tgtNorm.length() > 4 ? tgtNorm.substring(4).trim() : "";
+            if (rest.startsWith("/dev/")) tgtNorm = "USB:";
+        } else if (tgtNorm.startsWith("/dev/")) {
+            tgtNorm = "USB:";
+        }
+        // มี persistent printer ที่ตรงกับ target+series → reuse โดยไม่ต้อง connect ใหม่
+        if (sEpsonUsbPrinterInstance != null
+                && sEpsonUsbPrinterSeries == series
+                && tgtNorm.equalsIgnoreCase(
+                        sEpsonUsbPrinterTarget == null ? "" : sEpsonUsbPrinterTarget)) {
+            Log.i(TAG, "Epson USB: reusing persistent connection to \""
+                    + sEpsonUsbPrinterTarget + "\"");
+            return sEpsonUsbPrinterInstance;
+        }
+        // target/series เปลี่ยน → disconnect เก่าก่อนแล้วค่อย connect ใหม่
+        if (sEpsonUsbPrinterInstance != null) {
+            Log.i(TAG, "Epson USB: target/series changed — releasing old connection");
+            try { sEpsonUsbPrinterInstance.disconnect(); } catch (Throwable ignored) {}
+            sEpsonUsbPrinterInstance = null;
+            sEpsonUsbPrinterTarget   = null;
+            sEpsonUsbPrinterSeries   = -1;
+            sLastGoodEpsonUsbConnectTarget = null;
+            sleepQuiet(600);
+        }
+        // สร้างและ connect ใหม่
+        Log.i(TAG, "Epson USB: creating new persistent connection to \"" + tgtNorm + "\"");
+        Printer printer = epsonUsbCreateAndConnect(series, ctx, tgtNorm);
+        sEpsonUsbPrinterInstance = printer;
+        sEpsonUsbPrinterTarget   = tgtNorm;
+        sEpsonUsbPrinterSeries   = series;
+        return printer;
+    }
+
+    /**
+     * Discovery — รวบรวม target แล้วเลือกรูปแบบที่ไม่ใช่ Android {@code /dev/...} ก่อน
+     * (ถ้าใช้ dev-path แรกสุดแล้ว ERR_CONNECT แต่พอสลับไป USB: discovery คืน path เดิม จะวนซ้ำไม่จบ)
+     */
+    private static String epsonQuickUsbDiscoveryTarget(Context ctx, long maxWaitMs) {
+        final List<String> found = Collections.synchronizedList(new ArrayList<String>());
+        final CountDownLatch done = new CountDownLatch(1);
+        try {
+            FilterOption opt = new FilterOption();
+            opt.setPortType(Discovery.PORTTYPE_USB);
+            opt.setDeviceType(Discovery.TYPE_PRINTER);
+            DiscoveryListener listener = new DiscoveryListener() {
+                @Override
+                public void onDiscovery(DeviceInfo info) {
+                    try {
+                        String raw = safeStr(info.getTarget()).trim();
+                        if (raw.isEmpty()) return;
+                        if (!found.contains(raw)) {
+                            found.add(raw);
+                        }
+                        if (!raw.contains("/dev/")) {
+                            done.countDown();
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            };
+            Discovery.start(ctx, opt, listener);
+            done.await(maxWaitMs, TimeUnit.MILLISECONDS);
+        } catch (Throwable t) {
+            Log.w(TAG, "epsonQuickUsbDiscoveryTarget: " + t.getMessage());
+        } finally {
+            try {
+                Discovery.stop();
+            } catch (Throwable ignored) {}
+        }
+        String[] snap;
+        synchronized (found) {
+            snap = found.toArray(new String[0]);
+        }
+        if (snap.length == 0) return null;
+        for (String t : snap) {
+            if (t != null && !t.contains("/dev/")) {
+                return t;
+            }
+        }
+        return snap[0];
+    }
+
+    private static Printer epsonUsbCreateAndConnect(int series, Context ctx, String tgtRaw) throws Epos2Exception {
+        final boolean multiUsb = usbAttachedDeviceCount(ctx) > 1;
+        if (multiUsb) {
+            Log.i(TAG, "Epson USB: multiple USB devices attached — will not rely on plain \"USB:\" alone");
+        }
+
+        String trimmedRaw = tgtRaw == null ? "" : tgtRaw.trim();
+        String tgt = normalizeEpsonUsbConnectTarget(tgtRaw);
+        if (!trimmedRaw.equals(tgt)) {
+            Log.i(TAG, "Epson USB connect: normalized \"" + tgtRaw + "\" -> \"" + tgt + "\"");
+        }
+        // แอปอาจเก็บ "USB:/dev/bus/usb/..." — ลอง connect ด้วยค่าดิบก่อน (บางอุปกรณ์/USB: อย่างเดียวแล้ว ERR_CONNECT)
+        if ("USB:".equals(tgt) && trimmedRaw.length() > 4
+                && trimmedRaw.regionMatches(true, 0, "USB:", 0, 4)) {
+            String rest = trimmedRaw.substring(4).trim();
+            if (rest.startsWith("/dev/")) {
+                tgt = trimmedRaw;
+                Log.i(TAG, "Epson USB connect: trying raw dev-path target \"" + tgt + "\"");
+            }
+        }
+        if ("USB:".equals(tgt)) {
+            String cached = sLastGoodEpsonUsbConnectTarget;
+            if (cached != null && !cached.trim().isEmpty() && !cached.contains("/dev/")) {
+                tgt = cached.trim();
+                Log.i(TAG, "Epson USB using last successful target \"" + tgt + "\"");
+            } else {
+                String disc = epsonQuickUsbDiscoveryTarget(ctx, 900);
+                if (disc != null && !disc.isEmpty()) {
+                    if (!disc.contains("/dev/")) {
+                        tgt = disc;
+                        Log.i(TAG, "Epson USB pre-connect discovery -> \"" + tgt + "\"");
+                    } else if (multiUsb) {
+                        tgt = disc;
+                        Log.i(TAG, "Epson USB pre-connect: multi-USB — use discovery dev-path \"" + tgt + "\"");
+                    } else {
+                        Log.i(TAG, "Epson USB pre-connect: discovery only returned dev-path — keep plain USB:");
+                    }
+                }
+            }
+        }
+        if (multiUsb && "USB:".equals(tgt)) {
+            String discForce = epsonQuickUsbDiscoveryTarget(ctx, 1600);
+            if (discForce != null && !discForce.isEmpty()) {
+                tgt = discForce;
+                Log.w(TAG, "Epson USB multi-USB: refuse ambiguous USB: — using discovery \"" + tgt + "\"");
+            }
+        }
+        Epos2Exception last = null;
+        Printer printer = null;
+        for (int attempt = 0; attempt < 4; attempt++) {
+            if (printer != null) {
+                abandonEpsonPrinterUsb(printer);
+                printer = null;
+            }
+            if (attempt > 0) {
+                sleepQuiet(200L * attempt);
+            }
+            printer = new Printer(series, Printer.MODEL_ANK, ctx);
+            try {
+                Log.i(TAG, "Epson USB Printer.connect attempt=" + (attempt + 1)
+                        + " target=\"" + tgt + "\" series=" + series);
+                printer.connect(tgt, Printer.PARAM_DEFAULT);
+                if (tgt != null && !tgt.trim().isEmpty()) {
+                    String t = tgt.trim();
+                    // ไม่แคช path แบบ /dev/ — ใช้ซ้ำแล้วมักได้ ERR_ILLEGAL หลังพิมพ์หลายครั้ง
+                    if (!t.contains("/dev/")) {
+                        sLastGoodEpsonUsbConnectTarget = t;
+                    }
+                }
+                return printer;
+            } catch (Epos2Exception e) {
+                last = e;
+                int st = e.getErrorStatus();
+                if (attempt < 3) {
+                    if (st == Epos2Exception.ERR_CONNECT) {
+                        boolean leftDevPath = false;
+                        if (tgt != null && tgt.contains("/dev/")) {
+                            Log.w(TAG, "Epson USB ERR_CONNECT with dev-path target; switch to plain USB: (no dev re-apply)");
+                            tgt = "USB:";
+                            sLastGoodEpsonUsbConnectTarget = null;
+                            leftDevPath = true;
+                        }
+                        String disc = epsonQuickUsbDiscoveryTarget(ctx, 800);
+                        if (disc != null && !disc.isEmpty()) {
+                            if (disc.contains("/dev/") && leftDevPath) {
+                                if (multiUsb) {
+                                    tgt = disc;
+                                    Log.w(TAG, "Epson USB ERR_CONNECT: multi-USB — retry discovery dev-path \"" + tgt + "\"");
+                                } else {
+                                    tgt = "USB:";
+                                    Log.w(TAG, "Epson USB ERR_CONNECT: discovery still dev-path — retry with USB:");
+                                }
+                            } else {
+                                tgt = disc;
+                                Log.w(TAG, "Epson USB ERR_CONNECT; retry with discovery \"" + tgt + "\"");
+                            }
+                        } else {
+                            sleepQuiet(400);
+                        }
+                    } else if (st == Epos2Exception.ERR_IN_USE) {
+                        sleepQuiet(600);
+                    } else if (st == Epos2Exception.ERR_ILLEGAL) {
+                        Log.w(TAG, "Epson USB ERR_ILLEGAL — invalidate cache / refresh via discovery");
+                        sLastGoodEpsonUsbConnectTarget = null;
+                        sleepQuiet(500);
+                        String disc = epsonQuickUsbDiscoveryTarget(ctx, 1200);
+                        if (disc != null && !disc.isEmpty()) {
+                            tgt = disc;
+                            if (tgt.contains("/dev/") && !multiUsb) {
+                                tgt = "USB:";
+                                Log.w(TAG, "Epson USB ERR_ILLEGAL fallback to USB: after dev-path from discovery");
+                            }
+                        } else {
+                            if (multiUsb && trimmedRaw.regionMatches(true, 0, "USB:", 0, 4)
+                                    && trimmedRaw.contains("/dev/")) {
+                                tgt = trimmedRaw;
+                                Log.w(TAG, "Epson USB ERR_ILLEGAL: no discovery — retry saved target \"" + tgt + "\"");
+                            } else {
+                                tgt = "USB:";
+                            }
+                        }
+                    }
+                }
+                Log.w(TAG, "Epson USB connect attempt " + (attempt + 1) + " failed code=" + st);
+            }
+        }
+        if (last != null) {
+            int ec = last.getErrorStatus();
+            if (ec == Epos2Exception.ERR_CONNECT || ec == Epos2Exception.ERR_ILLEGAL) {
+                sLastGoodEpsonUsbConnectTarget = null;
+            }
+            abandonEpsonPrinterUsb(printer);
+            throw last;
+        }
+        throw new IllegalStateException("Epson USB connect failed");
+    }
+
+    private static String epsonUsbHintForCode(int code, Context ctx) {
+        if (code == Epos2Exception.ERR_CONNECT) {
+            return "เชื่อมต่อ USB ไม่สำเร็จ — ถอดสายแล้วเสียบใหม่ กดสแกน USB แล้วเลือกเครื่องอีกครั้ง";
+        }
+        if (code == Epos2Exception.ERR_ILLEGAL) {
+            if (ctx != null && usbAttachedDeviceCount(ctx) > 1) {
+                return "ต่อ USB หลายเครื่อง — ไม่ใช้ \"USB:\" เปล่าได้ ให้สแกนแล้วเลือก Epson จากรายการหรือถอดเครื่องที่ไม่พิมพ์ชั่วคราว";
+            }
+            return "พารามิเตอร์ connect ไม่ถูกต้องหรือสถานะ SDK ค้าง — กดสแกน USB ใหม่หรือรีสตาร์ทแอป";
+        }
+        if (code == Epos2Exception.ERR_IN_USE) {
+            return "อุปกรณ์ USB กำลังถูกใช้งาน — รอแล้วลองใหม่";
+        }
+        if (code == Epos2Exception.ERR_TIMEOUT) {
+            return "หมดเวลาเชื่อมต่อ USB";
+        }
+        return "ดูรหัสใน Epos2Exception";
+    }
+
     /** ค้นหา Epson USB devices ผ่าน Epson Discovery API */
     private List<JSONObject> epsonDiscoverUsb(Context ctx) {
         final List<JSONObject> found = new ArrayList<>();
@@ -1229,7 +1617,8 @@ public class PluginWifiPrinter extends CordovaPlugin {
                     try {
                         JSONObject o = new JSONObject();
                         o.put("brand", "epson");
-                        o.put("target", safeStr(info.getTarget()));
+                        String rawTgt = safeStr(info.getTarget()).trim();
+                        o.put("target", rawTgt.isEmpty() ? "USB:" : rawTgt);
                         o.put("deviceName", safeStr(info.getDeviceName()));
                         o.put("ipAddress", safeStr(info.getIpAddress()));
                         o.put("macAddress", safeStr(info.getMacAddress()));
@@ -1275,11 +1664,16 @@ public class PluginWifiPrinter extends CordovaPlugin {
         }
 
         UsbDevice device = null;
-        // หาตามชื่อ device (path) ก่อน — มาตรฐาน
-        for (UsbDevice d : um.getDeviceList().values()) {
-            if (target.equals(d.getDeviceName())) {
-                device = d;
-                break;
+        String pathFromEpson = androidUsbPathForPermissionLookup(target);
+        if (pathFromEpson != null) {
+            device = findUsbDeviceByDeviceName(um, pathFromEpson);
+        }
+        if (device == null) {
+            for (UsbDevice d : um.getDeviceList().values()) {
+                if (target.equals(d.getDeviceName())) {
+                    device = d;
+                    break;
+                }
             }
         }
         // ถ้าเป็น target ของ Epson เช่น "USB:..." → หาจาก vendor list ของ Epson แทน
@@ -1353,8 +1747,26 @@ public class PluginWifiPrinter extends CordovaPlugin {
     }
 
     private static boolean hasUsbPermissionForTarget(Context ctx, String target) {
+        if (ctx == null || target == null || target.trim().isEmpty()) {
+            return false;
+        }
         UsbManager um = (UsbManager) ctx.getSystemService(Context.USB_SERVICE);
-        UsbDevice d = findUsbDeviceByDeviceName(um, target);
+        if (um == null) {
+            return false;
+        }
+        String t = target.trim();
+        String pathFromEpson = androidUsbPathForPermissionLookup(t);
+        UsbDevice d = pathFromEpson != null
+                ? findUsbDeviceByDeviceName(um, pathFromEpson)
+                : findUsbDeviceByDeviceName(um, t);
+        if (d == null && t.regionMatches(true, 0, "USB:", 0, 4)) {
+            for (UsbDevice x : um.getDeviceList().values()) {
+                if (x.getVendorId() == 0x04B8) {
+                    d = x;
+                    break;
+                }
+            }
+        }
         return d != null && um.hasPermission(d);
     }
 
@@ -1375,9 +1787,38 @@ public class PluginWifiPrinter extends CordovaPlugin {
             return;
         }
         final int widthPx = paperWidth > 0 ? paperWidth : 576;
+        final String b = brand == null ? "" : brand.toLowerCase(Locale.ROOT);
         final String lockKey = "usb:" + brand + ":" + target;
 
         cordova.getThreadPool().execute(() -> {
+            if ("epson".equals(b)) {
+                Bitmap originalBitmap = null;
+                Bitmap processedBitmap = null;
+                try {
+                    byte[] decoded = Base64.decode(base64Image.replaceAll("\\s", ""), Base64.NO_WRAP);
+                    originalBitmap = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
+                    if (originalBitmap == null) {
+                        cb.error("❌ ไม่สามารถแปลง Base64 เป็นรูปภาพได้");
+                        return;
+                    }
+                    processedBitmap = resizeBitmap(originalBitmap, widthPx);
+                    processedBitmap = toBlackAndWhiteDither(processedBitmap);
+                    synchronized (EPSON_USB_GLOBAL_LOCK) {
+                        printBitmapEpsonUsb(target, processedBitmap, widthPx, modelStr, cb);
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "❌ USB Print error: " + e.getMessage(), e);
+                    cb.error("❌ ข้อผิดพลาด: " + e.getMessage());
+                } finally {
+                    if (processedBitmap != null && !processedBitmap.isRecycled()) {
+                        try { processedBitmap.recycle(); } catch (Exception ignored) {}
+                    }
+                    if (originalBitmap != null && !originalBitmap.isRecycled()) {
+                        try { originalBitmap.recycle(); } catch (Exception ignored) {}
+                    }
+                }
+                return;
+            }
             synchronized (printerLocks.computeIfAbsent(lockKey, k -> new Object())) {
                 Bitmap originalBitmap = null;
                 Bitmap processedBitmap = null;
@@ -1390,14 +1831,7 @@ public class PluginWifiPrinter extends CordovaPlugin {
                     }
                     processedBitmap = resizeBitmap(originalBitmap, widthPx);
                     processedBitmap = toBlackAndWhiteDither(processedBitmap);
-
-                    String b = brand == null ? "" : brand.toLowerCase(Locale.ROOT);
-                    if ("epson".equals(b)) {
-                        printBitmapEpsonUsb(target, processedBitmap, widthPx, modelStr, cb);
-                    } else {
-                        // ใช้ Xprinter SDK เป็นค่าตั้งต้น (ครอบคลุม XP-C300H, XP-T80, ฯลฯ)
-                        printBitmapXprinterUsb(target, processedBitmap, widthPx, cb);
-                    }
+                    printBitmapXprinterUsb(target, processedBitmap, widthPx, cb);
                 } catch (Exception e) {
                     Log.e(TAG, "❌ USB Print error: " + e.getMessage(), e);
                     cb.error("❌ ข้อผิดพลาด: " + e.getMessage());
@@ -1459,16 +1893,41 @@ public class PluginWifiPrinter extends CordovaPlugin {
     /** ส่งภาพไปยังเครื่อง Epson ผ่าน USB ด้วย ePOS2 Printer + addImage */
     private void printBitmapEpsonUsb(String target, Bitmap bmp, int widthPx,
                                      String modelStr, CallbackContext cb) {
-        Context ctx = cordova.getActivity().getApplicationContext();
-        Printer printer = null;
+        Context appCtx = getAppCtxForEpson();
+        if (appCtx == null) {
+            cb.error("Epson USB: ไม่พบ Application context");
+            return;
+        }
+        boolean sentOk = false;
         try {
+            if (!hasUsbPermissionForTarget(appCtx, target)) {
+                cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
+                return;
+            }
             int series = epsonModelFromString(modelStr);
-            printer = new Printer(series, Printer.MODEL_ANK, ctx);
-
-            // Epson target ตัวอย่าง: "USB:000000000000000000" หรือ "USB:" สำหรับเครื่องแรก
             String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
-            printer.connect(tgt, Printer.PARAM_DEFAULT);
-            printer.beginTransaction();
+
+            // ใช้ persistent printer (ไม่ disconnect ระหว่าง job — แก้ ERR_CONNECT ครั้งที่ 2+)
+            Printer printer = getOrCreateEpsonUsbPrinter(series, appCtx, tgt);
+            // ล้าง command buffer ก่อนเริ่ม transaction ใหม่ทุกครั้ง
+            try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+
+            // beginTransaction — ถ้าล้มด้วย ERR_ILLEGAL/ERR_CONNECT ให้ reset แล้วลองใหม่ 1 ครั้ง
+            try {
+                printer.beginTransaction();
+            } catch (Epos2Exception ex) {
+                int st = ex.getErrorStatus();
+                if (st == Epos2Exception.ERR_ILLEGAL || st == Epos2Exception.ERR_CONNECT) {
+                    Log.w(TAG, "Epson USB beginTransaction(" + st + ") — reset persistent printer and retry");
+                    invalidateEpsonUsbPrinter();
+                    sleepQuiet(700);
+                    printer = getOrCreateEpsonUsbPrinter(series, appCtx, tgt);
+                    try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+                    printer.beginTransaction();
+                } else {
+                    throw ex;
+                }
+            }
 
             printer.addTextAlign(Printer.ALIGN_CENTER);
             printer.addImage(
@@ -1484,22 +1943,27 @@ public class PluginWifiPrinter extends CordovaPlugin {
             printer.addCut(Printer.CUT_FEED);
 
             printer.sendData(Printer.PARAM_DEFAULT);
-            try { printer.endTransaction(); } catch (Exception ignored) {}
-            try { printer.disconnect(); } catch (Exception ignored) {}
-            printer.clearCommandBuffer();
-            cb.success("1");
+            sleepQuiet(380);
+            try {
+                printer.endTransaction();
+            } catch (Exception e) {
+                Log.w(TAG, "Epson USB endTransaction: " + e.getMessage());
+            }
+            sleepQuiet(120);
+            // *** ไม่ disconnect — เก็บ connection ไว้สำหรับงานพิมพ์ถัดไป ***
+            sentOk = true;
         } catch (Epos2Exception e) {
             int code = e.getErrorStatus();
             Log.e(TAG, "Epson USB print error code=" + code, e);
-            cb.error("Epson USB print error: code=" + code);
+            invalidateEpsonUsbPrinter(); // reset persistent state เมื่อเกิด error
+            cb.error("Epson USB print error: code=" + code + " — " + epsonUsbHintForCode(code, appCtx));
         } catch (Exception e) {
             Log.e(TAG, "Epson USB print error: " + e.getMessage(), e);
+            invalidateEpsonUsbPrinter();
             cb.error("Epson USB print error: " + e.getMessage());
-        } finally {
-            if (printer != null) {
-                try { printer.disconnect(); } catch (Exception ignored) {}
-                try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
-            }
+        }
+        if (sentOk) {
+            cb.success("1");
         }
     }
 
@@ -1547,31 +2011,60 @@ public class PluginWifiPrinter extends CordovaPlugin {
     }
 
     private void openCashDrawerEpsonUsb(String target, String modelStr, CallbackContext cb) {
-        Context ctx = cordova.getActivity().getApplicationContext();
-        Printer printer = null;
-        try {
-            int series = epsonModelFromString(modelStr);
-            printer = new Printer(series, Printer.MODEL_ANK, ctx);
-            String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
-            printer.connect(tgt, Printer.PARAM_DEFAULT);
-            printer.beginTransaction();
-            printer.addPulse(Printer.DRAWER_2PIN, Printer.PULSE_100);
-            printer.sendData(Printer.PARAM_DEFAULT);
-            try { printer.endTransaction(); } catch (Exception ignored) {}
-            try { printer.disconnect(); } catch (Exception ignored) {}
-            printer.clearCommandBuffer();
-            cb.success("✅ เปิดลิ้นชักเก็บเงินสำเร็จ (Epson)");
-        } catch (Epos2Exception e) {
-            int code = e.getErrorStatus();
-            Log.e(TAG, "openCashDrawerUsb (epson) code=" + code, e);
-            cb.error("Epson open drawer error: code=" + code);
-        } catch (Exception e) {
-            Log.e(TAG, "openCashDrawerUsb (epson) error: " + e.getMessage(), e);
-            cb.error("Epson open drawer error: " + e.getMessage());
-        } finally {
-            if (printer != null) {
-                try { printer.disconnect(); } catch (Exception ignored) {}
+        Context appCtx = getAppCtxForEpson();
+        if (appCtx == null) {
+            cb.error("Epson USB: ไม่พบ Application context");
+            return;
+        }
+        synchronized (EPSON_USB_GLOBAL_LOCK) {
+            boolean ok = false;
+            try {
+                if (!hasUsbPermissionForTarget(appCtx, target)) {
+                    cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
+                    return;
+                }
+                int series = epsonModelFromString(modelStr);
+                String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
+                Printer printer = getOrCreateEpsonUsbPrinter(series, appCtx, tgt);
                 try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+                try {
+                    printer.beginTransaction();
+                } catch (Epos2Exception ex) {
+                    int st = ex.getErrorStatus();
+                    if (st == Epos2Exception.ERR_ILLEGAL || st == Epos2Exception.ERR_CONNECT) {
+                        Log.w(TAG, "Epson USB drawer beginTransaction(" + st + ") — reset and retry");
+                        invalidateEpsonUsbPrinter();
+                        sleepQuiet(700);
+                        printer = getOrCreateEpsonUsbPrinter(series, appCtx, tgt);
+                        try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+                        printer.beginTransaction();
+                    } else {
+                        throw ex;
+                    }
+                }
+                printer.addPulse(Printer.DRAWER_2PIN, Printer.PULSE_100);
+                printer.sendData(Printer.PARAM_DEFAULT);
+                sleepQuiet(400);
+                try {
+                    printer.endTransaction();
+                } catch (Exception e) {
+                    Log.w(TAG, "Epson drawer endTransaction: " + e.getMessage());
+                }
+                sleepQuiet(150);
+                // *** ไม่ disconnect — เก็บ connection ไว้ ***
+                ok = true;
+            } catch (Epos2Exception e) {
+                int code = e.getErrorStatus();
+                Log.e(TAG, "openCashDrawerUsb (epson) code=" + code, e);
+                invalidateEpsonUsbPrinter();
+                cb.error("Epson open drawer error: code=" + code + " — " + epsonUsbHintForCode(code, appCtx));
+            } catch (Exception e) {
+                Log.e(TAG, "openCashDrawerUsb (epson) error: " + e.getMessage(), e);
+                invalidateEpsonUsbPrinter();
+                cb.error("Epson open drawer error: " + e.getMessage());
+            }
+            if (ok) {
+                cb.success("✅ เปิดลิ้นชักเก็บเงินสำเร็จ (Epson)");
             }
         }
     }
@@ -1585,23 +2078,32 @@ public class PluginWifiPrinter extends CordovaPlugin {
         final String b = brand == null ? "" : brand.toLowerCase(Locale.ROOT);
         cordova.getThreadPool().execute(() -> {
             if ("epson".equals(b)) {
-                Context ctx = cordova.getActivity().getApplicationContext();
-                Printer printer = null;
-                try {
-                    int series = epsonModelFromString(modelStr);
-                    printer = new Printer(series, Printer.MODEL_ANK, ctx);
-                    String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
-                    printer.connect(tgt, Printer.PARAM_DEFAULT);
-                    printer.clearCommandBuffer();
-                    try { printer.disconnect(); } catch (Exception ignored) {}
-                    cb.success("✅ เคลียร์คิวเครื่องพิมพ์ (Epson USB) แล้ว");
-                } catch (Exception e) {
-                    Log.e(TAG, "clearPrinterQueueUsb (epson) error: " + e.getMessage(), e);
-                    cb.error("Epson clear queue error: " + e.getMessage());
-                } finally {
-                    if (printer != null) {
-                        try { printer.disconnect(); } catch (Exception ignored) {}
-                        try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+                Context appCtx = getAppCtxForEpson();
+                if (appCtx == null) {
+                    cb.error("Epson USB: ไม่พบ Application context");
+                    return;
+                }
+                synchronized (EPSON_USB_GLOBAL_LOCK) {
+                    boolean ok = false;
+                    try {
+                        if (!hasUsbPermissionForTarget(appCtx, target)) {
+                            cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
+                            return;
+                        }
+                        int series = epsonModelFromString(modelStr);
+                        String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
+                        Printer printer = getOrCreateEpsonUsbPrinter(series, appCtx, tgt);
+                        printer.clearCommandBuffer();
+                        sleepQuiet(200);
+                        // *** ไม่ disconnect — เก็บ connection ไว้ ***
+                        ok = true;
+                    } catch (Exception e) {
+                        Log.e(TAG, "clearPrinterQueueUsb (epson) error: " + e.getMessage(), e);
+                        invalidateEpsonUsbPrinter();
+                        cb.error("Epson clear queue error: " + e.getMessage());
+                    }
+                    if (ok) {
+                        cb.success("✅ เคลียร์คิวเครื่องพิมพ์ (Epson USB) แล้ว");
                     }
                 }
             } else {
