@@ -818,13 +818,17 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
             if (!ok) {
                 NSLog(@"Epson USB sendData failed: %d", sendCode);
             }
+            // หลัง sendData ให้ USB/เฟิร์มแวร์ระบายก่อนปิด session — กันพิมพ์ครั้งถัดไม่ได้
+            [NSThread sleepForTimeInterval:0.5];
             [printer endTransaction];
+            [NSThread sleepForTimeInterval:0.2];
         } @catch (NSException *ex) {
             NSLog(@"Epson USB print exception: %@", ex);
             ok = NO;
         }
 
         [printer disconnect];
+        [NSThread sleepForTimeInterval:0.25];
         [printer clearCommandBuffer];
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -876,11 +880,14 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
             [printer addPulse:EPOS2_DRAWER_2PIN time:EPOS2_PULSE_100];
             int sendCode = [printer sendData:EPOS2_PARAM_DEFAULT];
             ok = (sendCode == EPOS2_SUCCESS);
+            [NSThread sleepForTimeInterval:0.4];
             [printer endTransaction];
+            [NSThread sleepForTimeInterval:0.15];
         } @catch (NSException *ex) {
             NSLog(@"Epson USB drawer exception: %@", ex);
         }
         [printer disconnect];
+        [NSThread sleepForTimeInterval:0.25];
         [printer clearCommandBuffer];
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ok) {
@@ -926,7 +933,9 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
             return;
         }
         [printer clearCommandBuffer];
+        [NSThread sleepForTimeInterval:0.2];
         [printer disconnect];
+        [NSThread sleepForTimeInterval:0.25];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self sendSuccess:@"✅ เคลียร์คิวเครื่องพิมพ์ Epson USB แล้ว" command:command];
         });

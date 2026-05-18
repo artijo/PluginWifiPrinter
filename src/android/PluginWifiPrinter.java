@@ -1358,6 +1358,34 @@ public class PluginWifiPrinter extends CordovaPlugin {
         return d != null && um.hasPermission(d);
     }
 
+    /** หน่วงเวลาแบบไม่ throw — ใช้หลัง sendData USB ให้เฟิร์มแวร์ TM-T82 ฯลฯ ระบายก่อน disconnect */
+    private static void sleepQuiet(long ms) {
+        if (ms <= 0) return;
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * ปิดการเชื่อมต่อ Epson USB แบบปลอดภัย — เรียกครั้งเดียวต่อ job (อย่า disconnect ซ้ำใน try แล้วซ้ำใน finally)
+     */
+    private static void releaseEpsonPrinterUsb(Printer printer) {
+        if (printer == null) return;
+        try {
+            try {
+                printer.disconnect();
+            } catch (Exception e) {
+                Log.w(TAG, "Epson USB disconnect: " + e.getMessage());
+            }
+            sleepQuiet(280);
+            printer.clearCommandBuffer();
+        } catch (Throwable t) {
+            Log.w(TAG, "Epson USB release cleanup: " + t.getMessage());
+        }
+    }
+
     /**
      * พิมพ์ภาพ Base64 ผ่าน USB
      * brand = "xprinter" หรือ "epson"
@@ -1459,8 +1487,10 @@ public class PluginWifiPrinter extends CordovaPlugin {
     /** ส่งภาพไปยังเครื่อง Epson ผ่าน USB ด้วย ePOS2 Printer + addImage */
     private void printBitmapEpsonUsb(String target, Bitmap bmp, int widthPx,
                                      String modelStr, CallbackContext cb) {
-        Context ctx = cordova.getActivity().getApplicationContext();
+        Activity act = cordova.getActivity();
+        Context ctx = act != null ? act : cordova.getContext();
         Printer printer = null;
+        boolean sentOk = false;
         try {
             int series = epsonModelFromString(modelStr);
             printer = new Printer(series, Printer.MODEL_ANK, ctx);
@@ -1484,10 +1514,15 @@ public class PluginWifiPrinter extends CordovaPlugin {
             printer.addCut(Printer.CUT_FEED);
 
             printer.sendData(Printer.PARAM_DEFAULT);
-            try { printer.endTransaction(); } catch (Exception ignored) {}
-            try { printer.disconnect(); } catch (Exception ignored) {}
-            printer.clearCommandBuffer();
-            cb.success("1");
+            // TM-T82II ฯลฯ — ถ้า disconnect ทันที USB session ค้าง พิมพ์ครั้งถัดไปไม่ออกจนกว่าจะรีแอป
+            sleepQuiet(500);
+            try {
+                printer.endTransaction();
+            } catch (Exception e) {
+                Log.w(TAG, "Epson USB endTransaction: " + e.getMessage());
+            }
+            sleepQuiet(200);
+            sentOk = true;
         } catch (Epos2Exception e) {
             int code = e.getErrorStatus();
             Log.e(TAG, "Epson USB print error code=" + code, e);
@@ -1496,10 +1531,10 @@ public class PluginWifiPrinter extends CordovaPlugin {
             Log.e(TAG, "Epson USB print error: " + e.getMessage(), e);
             cb.error("Epson USB print error: " + e.getMessage());
         } finally {
-            if (printer != null) {
-                try { printer.disconnect(); } catch (Exception ignored) {}
-                try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
-            }
+            releaseEpsonPrinterUsb(printer);
+        }
+        if (sentOk) {
+            cb.success("1");
         }
     }
 
@@ -1547,8 +1582,10 @@ public class PluginWifiPrinter extends CordovaPlugin {
     }
 
     private void openCashDrawerEpsonUsb(String target, String modelStr, CallbackContext cb) {
-        Context ctx = cordova.getActivity().getApplicationContext();
+        Activity act = cordova.getActivity();
+        Context ctx = act != null ? act : cordova.getContext();
         Printer printer = null;
+        boolean ok = false;
         try {
             int series = epsonModelFromString(modelStr);
             printer = new Printer(series, Printer.MODEL_ANK, ctx);
@@ -1557,10 +1594,14 @@ public class PluginWifiPrinter extends CordovaPlugin {
             printer.beginTransaction();
             printer.addPulse(Printer.DRAWER_2PIN, Printer.PULSE_100);
             printer.sendData(Printer.PARAM_DEFAULT);
-            try { printer.endTransaction(); } catch (Exception ignored) {}
-            try { printer.disconnect(); } catch (Exception ignored) {}
-            printer.clearCommandBuffer();
-            cb.success("✅ เปิดลิ้นชักเก็บเงินสำเร็จ (Epson)");
+            sleepQuiet(400);
+            try {
+                printer.endTransaction();
+            } catch (Exception e) {
+                Log.w(TAG, "Epson drawer endTransaction: " + e.getMessage());
+            }
+            sleepQuiet(150);
+            ok = true;
         } catch (Epos2Exception e) {
             int code = e.getErrorStatus();
             Log.e(TAG, "openCashDrawerUsb (epson) code=" + code, e);
@@ -1569,10 +1610,10 @@ public class PluginWifiPrinter extends CordovaPlugin {
             Log.e(TAG, "openCashDrawerUsb (epson) error: " + e.getMessage(), e);
             cb.error("Epson open drawer error: " + e.getMessage());
         } finally {
-            if (printer != null) {
-                try { printer.disconnect(); } catch (Exception ignored) {}
-                try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
-            }
+            releaseEpsonPrinterUsb(printer);
+        }
+        if (ok) {
+            cb.success("✅ เปิดลิ้นชักเก็บเงินสำเร็จ (Epson)");
         }
     }
 
@@ -1585,24 +1626,26 @@ public class PluginWifiPrinter extends CordovaPlugin {
         final String b = brand == null ? "" : brand.toLowerCase(Locale.ROOT);
         cordova.getThreadPool().execute(() -> {
             if ("epson".equals(b)) {
-                Context ctx = cordova.getActivity().getApplicationContext();
+                Activity act = cordova.getActivity();
+                Context ctx = act != null ? act : cordova.getContext();
                 Printer printer = null;
+                boolean ok = false;
                 try {
                     int series = epsonModelFromString(modelStr);
                     printer = new Printer(series, Printer.MODEL_ANK, ctx);
                     String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
                     printer.connect(tgt, Printer.PARAM_DEFAULT);
                     printer.clearCommandBuffer();
-                    try { printer.disconnect(); } catch (Exception ignored) {}
-                    cb.success("✅ เคลียร์คิวเครื่องพิมพ์ (Epson USB) แล้ว");
+                    sleepQuiet(200);
+                    ok = true;
                 } catch (Exception e) {
                     Log.e(TAG, "clearPrinterQueueUsb (epson) error: " + e.getMessage(), e);
                     cb.error("Epson clear queue error: " + e.getMessage());
                 } finally {
-                    if (printer != null) {
-                        try { printer.disconnect(); } catch (Exception ignored) {}
-                        try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
-                    }
+                    releaseEpsonPrinterUsb(printer);
+                }
+                if (ok) {
+                    cb.success("✅ เคลียร์คิวเครื่องพิมพ์ (Epson USB) แล้ว");
                 }
             } else {
                 ensurePosSdkInit();
