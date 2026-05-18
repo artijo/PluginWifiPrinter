@@ -631,6 +631,30 @@
 
 #if DELTAFOOD_HAS_EPSON
 /**
+ * ePOS2 ใช้ target จาก Discovery เช่น "USB:xxxxxxxx" หรือ "USB:"
+ * รูปแบบ "USB:/dev/bus/usb/..." ไม่ถูกต้อง — พิมพ์รอบแรกอาจได้ รอบถัดไม่เสถียร
+ */
+static NSString *deltafoodNormalizeEpsonUsbTarget(NSString *target) {
+    if (target == nil || target.length == 0) return @"USB:";
+    NSString *t = [target stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (t.length == 0) return @"USB:";
+    if (t.length >= 4 &&
+        [[t substringToIndex:4] caseInsensitiveCompare:@"USB:"] == NSOrderedSame) {
+        NSString *rest = [[t substringFromIndex:4]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([rest hasPrefix:@"/dev/"]) {
+            NSLog(@"[PluginWifiPrinter] Epson USB: invalid USB:+Android dev path — using USB:");
+            return @"USB:";
+        }
+    }
+    if ([t hasPrefix:@"/dev/bus/usb/"] || [t hasPrefix:@"/dev/usb/"]) {
+        NSLog(@"[PluginWifiPrinter] Epson USB: bare Android dev path — using USB:");
+        return @"USB:";
+    }
+    return t;
+}
+
+/**
  * Map model string (e.g. "TM_T82", "TM_T82X", "TM-T82") to Epson series enum.
  * Defaults to EPOS2_TM_T82.
  */
@@ -723,7 +747,7 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
             for (Epos2DeviceInfo *info in delegate.devices) {
                 [printers addObject:@{
                     @"brand": @"epson",
-                    @"target": [info getTarget] ?: @"",
+                    @"target": deltafoodNormalizeEpsonUsbTarget([info getTarget]),
                     @"deviceName": [info getDeviceName] ?: @"",
                     @"ipAddress": [info getIpAddress] ?: @"",
                     @"macAddress": [info getMacAddress] ?: @"",
@@ -789,7 +813,10 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
             return;
         }
 
-        NSString *tgt = ([target hasPrefix:@"USB:"]) ? target : @"USB:";
+        NSString *tgt = deltafoodNormalizeEpsonUsbTarget(target);
+        if (![tgt isEqualToString:target] && target.length > 0) {
+            NSLog(@"[PluginWifiPrinter] Epson USB connect normalized \"%@\" -> \"%@\"", target, tgt);
+        }
         int code = [printer connect:tgt timeout:EPOS2_PARAM_DEFAULT];
         if (code != EPOS2_SUCCESS) {
             [self sendError:[NSString stringWithFormat:@"Epson USB connect failed (code=%d)", code]
@@ -867,7 +894,7 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
             [self sendError:@"ไม่สามารถสร้าง Epson printer instance ได้" command:command];
             return;
         }
-        NSString *tgt = ([target hasPrefix:@"USB:"]) ? target : @"USB:";
+        NSString *tgt = deltafoodNormalizeEpsonUsbTarget(target);
         int code = [printer connect:tgt timeout:EPOS2_PARAM_DEFAULT];
         if (code != EPOS2_SUCCESS) {
             [self sendError:[NSString stringWithFormat:@"Epson USB connect failed (code=%d)", code]
@@ -925,7 +952,7 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
             [self sendError:@"ไม่สามารถสร้าง Epson printer instance ได้" command:command];
             return;
         }
-        NSString *tgt = ([target hasPrefix:@"USB:"]) ? target : @"USB:";
+        NSString *tgt = deltafoodNormalizeEpsonUsbTarget(target);
         int code = [printer connect:tgt timeout:EPOS2_PARAM_DEFAULT];
         if (code != EPOS2_SUCCESS) {
             [self sendError:[NSString stringWithFormat:@"Epson USB connect failed (code=%d)", code]
