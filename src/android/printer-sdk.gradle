@@ -1,10 +1,19 @@
-// Xprinter POS SDK (TCP/LAN). Cordova applies this via plugin.xml `gradleReference`.
+// Xprinter POS SDK (TCP/LAN + USB) + Epson ePOS2 SDK (TCP/LAN + USB).
+//
+// Capacitor applies this from BOTH:
+//   - :capacitor-cordova-android-plugins/build.gradle
+//   - :app/capacitor.build.gradle (generated)
+// Relative paths like src/main/libs/ only resolve on the Cordova library module.
+// Binaries are always copied to :capacitor-cordova-android-plugins — resolve from Gradle root (android/).
+def cordovaPrinterLibsDir = rootProject.file('capacitor-cordova-android-plugins/src/main/libs')
+
 repositories {
     flatDir {
-        dirs 'libs'
+        dirs cordovaPrinterLibsDir
     }
 }
 
 dependencies {
     implementation(name: 'printer-lib-3.2.0', ext: 'aar')
+    implementation files(new File(cordovaPrinterLibsDir, 'ePOS2.jar'))
 }

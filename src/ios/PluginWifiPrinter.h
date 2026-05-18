@@ -12,4 +12,11 @@
 - (void)checkIpWithPort:(CDVInvokedUrlCommand*)command;
 - (void)openCashDrawer:(CDVInvokedUrlCommand*)command;
 
+// USB — Epson MFi printers on iOS/iPadOS (Xprinter iOS USB is not supported by their SDK)
+- (void)requestUsbPermission:(CDVInvokedUrlCommand*)command;
+- (void)listUsbPrinters:(CDVInvokedUrlCommand*)command;
+- (void)printBase64ImageToUsb:(CDVInvokedUrlCommand*)command;
+- (void)openCashDrawerUsb:(CDVInvokedUrlCommand*)command;
+- (void)clearPrinterQueueUsb:(CDVInvokedUrlCommand*)command;
+
 @end

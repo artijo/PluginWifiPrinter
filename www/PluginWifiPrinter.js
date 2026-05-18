@@ -139,3 +139,115 @@ exports.printBitmapToSpi = function (spiDevicePath, base64Data, paperWidth, succ
   );
 };
 
+//============================================================
+//============= USB (Xprinter / Epson)  ======================
+//============================================================
+// เครื่อง POS Android (Sunmi/Landi/iMin) เสียบสาย USB เข้ากับเครื่องพิมพ์
+// บราเดอร์ Xprinter (XP-C300H/XP-T80/ฯลฯ) ใช้ POSConnect.DEVICE_TYPE_USB
+// บราเดอร์ Epson (TM-T82X/TM-T88/ฯลฯ) ใช้ Epson ePOS2 SDK
+//
+// บน iOS รองรับเฉพาะ Epson (USB MFi) — Xprinter iOS USB จะส่ง error กลับ
+
+/**
+ * รายการอุปกรณ์ USB ที่เห็นอยู่ตอนนี้
+ * @param {string} brand  "xprinter"|"epson"|"all" (default "all")
+ * @returns success({ printers: [{brand,target,deviceName,vendorId,productId,...}] })
+ */
+exports.listUsbPrinters = function (brand, success, error) {
+  if (typeof brand === 'function') {
+    error = success;
+    success = brand;
+    brand = 'all';
+  }
+  exec(
+    function (res) {
+      var parsed = res;
+      if (typeof res === 'string') {
+        try { parsed = JSON.parse(res); }
+        catch (e) { console.warn('listUsbPrinters parse error', e); parsed = { printers: [] }; }
+      }
+      success && success(parsed && parsed.printers ? parsed.printers : []);
+    },
+    function (err) { error && error(err); },
+    'PluginWifiPrinter',
+    'listUsbPrinters',
+    [brand || 'all']
+  );
+};
+
+/**
+ * ขอสิทธิ์เข้าถึงอุปกรณ์ USB (Android เท่านั้น — ครั้งแรกจะเห็น dialog ระบบ)
+ * @param {string} target  devicePath เช่น "/dev/bus/usb/001/003" หรือ "USB:..." (Epson)
+ * @returns success("granted"|"already") | error(message)
+ */
+exports.requestUsbPermission = function (target, success, error) {
+  exec(success, error, 'PluginWifiPrinter', 'requestUsbPermission', [target]);
+};
+
+/**
+ * พิมพ์ภาพ Base64 ผ่าน USB
+ * @param {string} brand        "xprinter"|"epson"
+ * @param {string} target       devicePath / "USB:<serial>"
+ * @param {string} base64Data   รูปภาพ Base64 (ไม่มี data:image/png;base64,)
+ * @param {number} paperWidth   ความกว้างเป็น px (384=58mm, 576=80mm)
+ * @param {string} model        (เฉพาะ Epson) เช่น "TM_T82","TM_T88","TM_M30"
+ */
+exports.printBase64ImageToUsb = function (brand, target, base64Data, paperWidth, model, success, error) {
+  if (typeof paperWidth === 'function') {
+    error = model;
+    success = paperWidth;
+    paperWidth = 576;
+    model = '';
+  } else if (typeof model === 'function') {
+    error = success;
+    success = model;
+    model = '';
+  }
+  var w = paperWidth != null && paperWidth !== '' ? Number(paperWidth) : 576;
+  if (!isFinite(w) || w <= 0) w = 576;
+
+  exec(
+    success,
+    error,
+    'PluginWifiPrinter',
+    'printBase64ImageToUsb',
+    [brand || 'xprinter', target, base64Data, w, model || '']
+  );
+};
+
+/**
+ * เปิดลิ้นชักเก็บเงินผ่าน USB
+ */
+exports.openCashDrawerUsb = function (brand, target, model, success, error) {
+  if (typeof model === 'function') {
+    error = success;
+    success = model;
+    model = '';
+  }
+  exec(
+    success,
+    error,
+    'PluginWifiPrinter',
+    'openCashDrawerUsb',
+    [brand || 'xprinter', target, model || '']
+  );
+};
+
+/**
+ * เคลียร์คิวเครื่องพิมพ์ผ่าน USB
+ */
+exports.clearPrinterQueueUsb = function (brand, target, model, success, error) {
+  if (typeof model === 'function') {
+    error = success;
+    success = model;
+    model = '';
+  }
+  exec(
+    success,
+    error,
+    'PluginWifiPrinter',
+    'clearPrinterQueueUsb',
+    [brand || 'xprinter', target, model || '']
+  );
+};
+

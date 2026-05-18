@@ -25,9 +25,21 @@
             <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
             <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
             <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+            <!-- USB host (for direct-attached thermal printers via OTG/USB port) -->
+            <uses-feature android:name="android.hardware.usb.host" android:required="false" />
         </config-file>
 
+        <!-- Xprinter Android SDK 3.2.0 (TCP/LAN + USB) -->
         <resource-file src="src/android/libs/printer-lib-3.2.0.aar" target="libs/printer-lib-3.2.0.aar" />
+
+        <!-- Epson ePOS2 SDK Android v2.36.0 (TCP/LAN + USB) -->
+        <resource-file src="src/android/libs/ePOS2.jar" target="libs/ePOS2.jar" />
+        <!-- Cordova prepends src/main/ to target — use jniLibs/... only (not src/main/jniLibs/...) -->
+        <resource-file src="src/android/libs/jniLibs/arm64-v8a/libepos2.so"   target="jniLibs/arm64-v8a/libepos2.so" />
+        <resource-file src="src/android/libs/jniLibs/armeabi-v7a/libepos2.so" target="jniLibs/armeabi-v7a/libepos2.so" />
+        <resource-file src="src/android/libs/jniLibs/x86/libepos2.so"          target="jniLibs/x86/libepos2.so" />
+        <resource-file src="src/android/libs/jniLibs/x86_64/libepos2.so"       target="jniLibs/x86_64/libepos2.so" />
+
         <framework src="src/android/printer-sdk.gradle" custom="true" type="gradleReference" />
 
         <source-file src="src/android/PluginWifiPrinter.java" target-dir="src/com/yourcompany/pluginwifiprinter" />
@@ -62,12 +74,14 @@
         <header-file src="src/ios/XprinterSDK/Headers/LabelImageTranster.h" />
         <framework src="src/ios/XprinterSDK/libPrinterSDK.a" custom="true" />
 
+        <!-- Epson ePOS2 SDK iOS v2.36.0 (TCP/LAN + USB MFi).
+             The xcframework is linked via the patch-ios-printer-sdk.js script
+             which modifies the Capacitor-generated Package.swift to add a
+             .binaryTarget pointing at this xcframework. -->
+
         <header-file src="src/ios/PluginWifiPrinter.h" />
         <source-file src="src/ios/PluginWifiPrinter.m" />
 
     </platform>
 
 </plugin>
-
-<!-- <?xml version='1.0' encoding='utf-8'?>
-<plugin id="com.yourcompany.pluginwifiprinter" version="1.0.0" xmlns="http://apache.org/cordova/ns/plugins/1.0" xmlns:android="http://schemas.android.com/apk/res/android"><name>PluginWifiPrinter</name><js-module name="PluginWifiPrinter" src="www/PluginWifiPrinter.js"><clobbers target="cordova.plugins.PluginWifiPrinter" /></js-module><platform name="android"><config-file parent="/*" target="res/xml/config.xml"><feature name="PluginWifiPrinter"><param name="android-package" value="com.yourcompany.pluginwifiprinter.PluginWifiPrinter" /></feature></config-file><config-file parent="/*" target="AndroidManifest.xml"><uses-permission android:name="android.permission.INTERNET" /><uses-permission android:name="android.permission.ACCESS_WIFI_STATE" /><uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" /><uses-permission android:name="android.permission.CHANGE_WIFI_STATE" /></config-file><source-file src="src/android/PluginWifiPrinter.java" target-dir="com/yourcompany/pluginwifiprinter" /></platform><platform name="ios"><config-file parent="/*" target="config.xml"><feature name="PluginWifiPrinter"><param name="ios-package" value="PluginWifiPrinter" /></feature></config-file><source-file src="src/ios/PluginWifiPrinter.m" /></platform></plugin> -->

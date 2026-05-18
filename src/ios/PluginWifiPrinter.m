@@ -7,6 +7,17 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+// Epson ePOS2 SDK — provided as libepos2.xcframework (umbrella header: ePOS2.h)
+// Imported via module to avoid forcing an exact filesystem path. If the import
+// fails to resolve (e.g. when running on a target without the framework linked),
+// the USB methods will surface a friendly error.
+#if __has_include(<libepos2/ePOS2.h>)
+  #import <libepos2/ePOS2.h>
+  #define DELTAFOOD_HAS_EPSON 1
+#else
+  #define DELTAFOOD_HAS_EPSON 0
+#endif
+
 /** Temporary delegate to await Xprinter LAN connect. */
 @interface DeltafoodXprinterWifiGate : NSObject <POSWIFIManagerDelegate>
 @property (nonatomic) dispatch_semaphore_t connectSem;
@@ -614,6 +625,313 @@
 - (void)clearPrinter:(int)sock {
     const unsigned char clearCmd[] = {0x1B, 0x40}; // ESC @
     send(sock, clearCmd, sizeof(clearCmd), 0);
+}
+
+#pragma mark - USB (Epson MFi)
+
+#if DELTAFOOD_HAS_EPSON
+/**
+ * Map model string (e.g. "TM_T82", "TM_T82X", "TM-T82") to Epson series enum.
+ * Defaults to EPOS2_TM_T82.
+ */
+static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
+    if (modelStr == nil) return EPOS2_TM_T82;
+    NSString *s = [[modelStr uppercaseString]
+                   stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
+    s = [s stringByReplacingOccurrencesOfString:@" " withString:@""];
+    if ([s hasPrefix:@"TM_T82"]) return EPOS2_TM_T82;
+    if ([s hasPrefix:@"TM_T88"]) return EPOS2_TM_T88;
+    if ([s hasPrefix:@"TM_T20"]) return EPOS2_TM_T20;
+    if ([s hasPrefix:@"TM_T70"]) return EPOS2_TM_T70;
+    if ([s hasPrefix:@"TM_T81"]) return EPOS2_TM_T81;
+    if ([s hasPrefix:@"TM_T83"]) return EPOS2_TM_T83;
+    if ([s hasPrefix:@"TM_T90"]) return EPOS2_TM_T90;
+    if ([s hasPrefix:@"TM_T100"]) return EPOS2_TM_T100;
+    if ([s hasPrefix:@"TM_M10"]) return EPOS2_TM_M10;
+    if ([s hasPrefix:@"TM_M30III"]) return EPOS2_TM_M30III;
+    if ([s hasPrefix:@"TM_M30II"]) return EPOS2_TM_M30II;
+    if ([s hasPrefix:@"TM_M30"]) return EPOS2_TM_M30;
+    if ([s hasPrefix:@"TM_M50"]) return EPOS2_TM_M50;
+    if ([s hasPrefix:@"TM_P20"]) return EPOS2_TM_P20;
+    if ([s hasPrefix:@"TM_P60II"]) return EPOS2_TM_P60II;
+    if ([s hasPrefix:@"TM_P60"]) return EPOS2_TM_P60;
+    if ([s hasPrefix:@"TM_P80"]) return EPOS2_TM_P80;
+    return EPOS2_TM_T82;
+}
+
+/**
+ * Internal delegate for collecting Epson USB Discovery results.
+ */
+@interface DeltafoodEpsonDiscoveryDelegate : NSObject<Epos2DiscoveryDelegate>
+@property (nonatomic, strong) NSMutableArray<Epos2DeviceInfo*> *devices;
+@end
+@implementation DeltafoodEpsonDiscoveryDelegate
+- (instancetype)init {
+    if ((self = [super init])) {
+        _devices = [NSMutableArray array];
+    }
+    return self;
+}
+- (void)onDiscovery:(Epos2DeviceInfo *)deviceInfo {
+    @synchronized (self.devices) {
+        [self.devices addObject:deviceInfo];
+    }
+}
+@end
+#endif
+
+- (void)requestUsbPermission:(CDVInvokedUrlCommand*)command {
+    // iOS/iPadOS ไม่มี Android UsbManager + dialog อนุญาตแบบเดียวกัน — Epson MFi ใช้สิทธิ์ระดับระบบ
+    // คืนสำเร็จเสมอเพื่อให้ฝั่ง Angular (เลือกเครื่อง → ทดสอบพิมพ์) ไม่ค้าง
+    [self sendSuccess:@"already" command:command];
+}
+
+- (void)listUsbPrinters:(CDVInvokedUrlCommand*)command {
+    NSString *brandRaw = command.arguments.count > 0 ? [command.arguments objectAtIndex:0] : @"all";
+    NSString *brand = [[brandRaw description] lowercaseString];
+
+    // Xprinter ไม่มี USB SDK บน iOS — ไม่เรียก discovery (ประหยัดเวลา / คืนรายการว่างให้ชัดเจน)
+    if ([brand isEqualToString:@"xprinter"]) {
+        CDVPluginResult *r = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                          messageAsDictionary:@{ @"printers": @[] }];
+        [self.commandDelegate sendPluginResult:r callbackId:command.callbackId];
+        return;
+    }
+
+#if !DELTAFOOD_HAS_EPSON
+    [self sendError:@"Epson SDK ไม่ได้ลิงก์กับ iOS build นี้" command:command];
+#else
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        DeltafoodEpsonDiscoveryDelegate *delegate = [DeltafoodEpsonDiscoveryDelegate new];
+        Epos2FilterOption *opt = [[Epos2FilterOption alloc] init];
+        [opt setPortType:EPOS2_PORTTYPE_USB];
+        [opt setDeviceType:EPOS2_TYPE_PRINTER];
+
+        int code = [Epos2Discovery start:opt delegate:delegate];
+        if (code != EPOS2_SUCCESS) {
+            [self sendError:[NSString stringWithFormat:@"Epson discovery start failed (code=%d)", code]
+                    command:command];
+            return;
+        }
+
+        // Wait briefly for async callbacks
+        [NSThread sleepForTimeInterval:2.5];
+        [Epos2Discovery stop];
+
+        NSMutableArray *printers = [NSMutableArray array];
+        @synchronized (delegate.devices) {
+            for (Epos2DeviceInfo *info in delegate.devices) {
+                [printers addObject:@{
+                    @"brand": @"epson",
+                    @"target": [info getTarget] ?: @"",
+                    @"deviceName": [info getDeviceName] ?: @"",
+                    @"ipAddress": [info getIpAddress] ?: @"",
+                    @"macAddress": [info getMacAddress] ?: @"",
+                }];
+            }
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CDVPluginResult *r = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                              messageAsDictionary:@{@"printers": printers}];
+            [self.commandDelegate sendPluginResult:r callbackId:command.callbackId];
+        });
+    });
+#endif
+}
+
+- (void)printBase64ImageToUsb:(CDVInvokedUrlCommand*)command {
+#if !DELTAFOOD_HAS_EPSON
+    [self sendError:@"Epson SDK ไม่ได้ลิงก์กับ iOS build นี้" command:command];
+#else
+    NSString *brand     = [command.arguments objectAtIndex:0]; // "xprinter"|"epson"
+    NSString *target    = [command.arguments objectAtIndex:1];
+    NSString *base64    = [command.arguments objectAtIndex:2];
+    CGFloat paperWidth  = 576.f;
+    if (command.arguments.count > 3) {
+        NSObject *pw = [command.arguments objectAtIndex:3];
+        if ([pw respondsToSelector:@selector(floatValue)]) {
+            paperWidth = [(NSNumber*)pw floatValue];
+        }
+    }
+    NSString *modelStr = command.arguments.count > 4
+        ? [command.arguments objectAtIndex:4] : @"TM_T82";
+
+    if (target == nil || target.length == 0 || base64 == nil || base64.length == 0) {
+        [self sendError:@"USB target หรือ Base64 ว่าง" command:command];
+        return;
+    }
+    if (paperWidth <= 0) paperWidth = 576.f;
+
+    NSString *brandLower = [(brand ?: @"") lowercaseString];
+    if ([brandLower isEqualToString:@"xprinter"]) {
+        [self sendError:@"Xprinter ไม่รองรับการเชื่อม USB ฝั่ง iOS — กรุณาเลือก LAN" command:command];
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSData *imageData = [[NSData alloc]
+                             initWithBase64EncodedString:base64
+                             options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        UIImage *image = imageData ? [UIImage imageWithData:imageData] : nil;
+        if (image == nil) {
+            [self sendError:@"❌ Base64 ไม่ถูกต้อง" command:command];
+            return;
+        }
+
+        UIImage *processed = [self resizeImage:image maxWidth:paperWidth];
+
+        int series = deltafoodEpsonSeriesFromString(modelStr);
+        Epos2Printer *printer =
+            [[Epos2Printer alloc] initWithPrinterSeries:series lang:EPOS2_MODEL_ANK];
+        if (printer == nil) {
+            [self sendError:@"ไม่สามารถสร้าง Epson printer instance ได้" command:command];
+            return;
+        }
+
+        NSString *tgt = ([target hasPrefix:@"USB:"]) ? target : @"USB:";
+        int code = [printer connect:tgt timeout:EPOS2_PARAM_DEFAULT];
+        if (code != EPOS2_SUCCESS) {
+            [self sendError:[NSString stringWithFormat:@"Epson USB connect failed (code=%d)", code]
+                    command:command];
+            return;
+        }
+
+        BOOL ok = NO;
+        @try {
+            [printer beginTransaction];
+            [printer addTextAlign:EPOS2_ALIGN_CENTER];
+            [printer addImage:processed
+                            x:0 y:0
+                        width:(long)processed.size.width
+                       height:(long)processed.size.height
+                        color:EPOS2_COLOR_1
+                         mode:EPOS2_MODE_MONO
+                     halftone:EPOS2_HALFTONE_DITHER
+                   brightness:EPOS2_PARAM_DEFAULT
+                     compress:EPOS2_PARAM_DEFAULT];
+            [printer addFeedLine:3];
+            [printer addCut:EPOS2_CUT_FEED];
+
+            int sendCode = [printer sendData:EPOS2_PARAM_DEFAULT];
+            ok = (sendCode == EPOS2_SUCCESS);
+            if (!ok) {
+                NSLog(@"Epson USB sendData failed: %d", sendCode);
+            }
+            [printer endTransaction];
+        } @catch (NSException *ex) {
+            NSLog(@"Epson USB print exception: %@", ex);
+            ok = NO;
+        }
+
+        [printer disconnect];
+        [printer clearCommandBuffer];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (ok) {
+                [self sendSuccess:@"1" command:command];
+            } else {
+                [self sendError:@"พิมพ์ผ่าน Epson USB ไม่สำเร็จ" command:command];
+            }
+        });
+    });
+#endif
+}
+
+- (void)openCashDrawerUsb:(CDVInvokedUrlCommand*)command {
+#if !DELTAFOOD_HAS_EPSON
+    [self sendError:@"Epson SDK ไม่ได้ลิงก์กับ iOS build นี้" command:command];
+#else
+    NSString *brand  = [command.arguments objectAtIndex:0];
+    NSString *target = [command.arguments objectAtIndex:1];
+    NSString *modelStr = command.arguments.count > 2
+        ? [command.arguments objectAtIndex:2] : @"TM_T82";
+    if (target == nil || target.length == 0) {
+        [self sendError:@"ไม่มี USB target" command:command];
+        return;
+    }
+    NSString *brandLower = [(brand ?: @"") lowercaseString];
+    if ([brandLower isEqualToString:@"xprinter"]) {
+        [self sendError:@"Xprinter iOS ไม่รองรับ USB" command:command];
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        int series = deltafoodEpsonSeriesFromString(modelStr);
+        Epos2Printer *printer =
+            [[Epos2Printer alloc] initWithPrinterSeries:series lang:EPOS2_MODEL_ANK];
+        if (printer == nil) {
+            [self sendError:@"ไม่สามารถสร้าง Epson printer instance ได้" command:command];
+            return;
+        }
+        NSString *tgt = ([target hasPrefix:@"USB:"]) ? target : @"USB:";
+        int code = [printer connect:tgt timeout:EPOS2_PARAM_DEFAULT];
+        if (code != EPOS2_SUCCESS) {
+            [self sendError:[NSString stringWithFormat:@"Epson USB connect failed (code=%d)", code]
+                    command:command];
+            return;
+        }
+        BOOL ok = NO;
+        @try {
+            [printer beginTransaction];
+            [printer addPulse:EPOS2_DRAWER_2PIN time:EPOS2_PULSE_100];
+            int sendCode = [printer sendData:EPOS2_PARAM_DEFAULT];
+            ok = (sendCode == EPOS2_SUCCESS);
+            [printer endTransaction];
+        } @catch (NSException *ex) {
+            NSLog(@"Epson USB drawer exception: %@", ex);
+        }
+        [printer disconnect];
+        [printer clearCommandBuffer];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (ok) {
+                [self sendSuccess:@"✅ เปิดลิ้นชักเก็บเงินสำเร็จ" command:command];
+            } else {
+                [self sendError:@"เปิดลิ้นชักเก็บเงินล้มเหลว" command:command];
+            }
+        });
+    });
+#endif
+}
+
+- (void)clearPrinterQueueUsb:(CDVInvokedUrlCommand*)command {
+#if !DELTAFOOD_HAS_EPSON
+    [self sendError:@"Epson SDK ไม่ได้ลิงก์กับ iOS build นี้" command:command];
+#else
+    NSString *brand  = [command.arguments objectAtIndex:0];
+    NSString *target = [command.arguments objectAtIndex:1];
+    NSString *modelStr = command.arguments.count > 2
+        ? [command.arguments objectAtIndex:2] : @"TM_T82";
+    if (target == nil || target.length == 0) {
+        [self sendError:@"ไม่มี USB target" command:command];
+        return;
+    }
+    NSString *brandLower = [(brand ?: @"") lowercaseString];
+    if ([brandLower isEqualToString:@"xprinter"]) {
+        [self sendError:@"Xprinter iOS ไม่รองรับ USB" command:command];
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        int series = deltafoodEpsonSeriesFromString(modelStr);
+        Epos2Printer *printer =
+            [[Epos2Printer alloc] initWithPrinterSeries:series lang:EPOS2_MODEL_ANK];
+        if (printer == nil) {
+            [self sendError:@"ไม่สามารถสร้าง Epson printer instance ได้" command:command];
+            return;
+        }
+        NSString *tgt = ([target hasPrefix:@"USB:"]) ? target : @"USB:";
+        int code = [printer connect:tgt timeout:EPOS2_PARAM_DEFAULT];
+        if (code != EPOS2_SUCCESS) {
+            [self sendError:[NSString stringWithFormat:@"Epson USB connect failed (code=%d)", code]
+                    command:command];
+            return;
+        }
+        [printer clearCommandBuffer];
+        [printer disconnect];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self sendSuccess:@"✅ เคลียร์คิวเครื่องพิมพ์ Epson USB แล้ว" command:command];
+        });
+    });
+#endif
 }
 
 @end
