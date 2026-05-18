@@ -942,50 +942,42 @@ public class PluginWifiPrinter extends CordovaPlugin {
     }
 
     private Bitmap toBlackAndWhiteDither(Bitmap original) {
-        int width = original.getWidth();
+        int width  = original.getWidth();
         int height = original.getHeight();
 
-        // สร้าง bitmap ใหม่เพื่อเขียนลงไป
-        Bitmap bwBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        // ดึง pixels ทั้งหมดในครั้งเดียว (เร็วกว่า getPixel loop ~20x — ลด JNI overhead)
+        int[] pixels = new int[width * height];
+        original.getPixels(pixels, 0, width, 0, 0, width, height);
 
-        // แปลงเป็น grayscale array
-        int[][] gray = new int[height][width];
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int pixel = original.getPixel(x, y);
-                int r = Color.red(pixel);
-                int g = Color.green(pixel);
-                int b = Color.blue(pixel);
-                gray[y][x] = (r + g + b) / 3;
-            }
+        // grayscale float array (float ให้ error accumulation แม่นยำกว่า int)
+        float[] gray = new float[width * height];
+        for (int i = 0; i < pixels.length; i++) {
+            int p = pixels[i];
+            gray[i] = ((p >> 16 & 0xFF) + (p >> 8 & 0xFF) + (p & 0xFF)) / 3f;
         }
 
-        // Floyd–Steinberg Dithering
+        // Floyd–Steinberg Dithering (เขียนผลลัพธ์กลับลง pixels[] โดยตรง)
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                int oldPixel = gray[y][x];
-                // int newPixel = oldPixel < 128 ? 0 : 255;
-                int newPixel = oldPixel < 160 ? 0 : 255;
-                int error = oldPixel - newPixel;
-
-                bwBitmap.setPixel(x, y, newPixel == 0 ? Color.BLACK : Color.WHITE);
-
-                // กระจาย error
-                if (x + 1 < width) {
-                    gray[y][x + 1] += error * 7 / 16;
-                }
+                int   idx    = y * width + x;
+                float oldVal = gray[idx];
+                int   newVal = oldVal < 160 ? 0 : 255;
+                float error  = oldVal - newVal;
+                pixels[idx]  = (newVal == 0) ? 0xFF000000 : 0xFFFFFFFF;
+                if (x + 1 < width)
+                    gray[idx + 1]           += error * 7f / 16f;
                 if (y + 1 < height) {
-                    if (x > 0) {
-                        gray[y + 1][x - 1] += error * 3 / 16;
-                    }
-                    gray[y + 1][x] += error * 5 / 16;
-                    if (x + 1 < width) {
-                        gray[y + 1][x + 1] += error * 1 / 16;
-                    }
+                    if (x > 0)
+                        gray[idx + width - 1] += error * 3f / 16f;
+                    gray[idx + width]         += error * 5f / 16f;
+                    if (x + 1 < width)
+                        gray[idx + width + 1] += error * 1f / 16f;
                 }
             }
         }
 
+        Bitmap bwBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        bwBitmap.setPixels(pixels, 0, width, 0, 0, width, height);
         return bwBitmap;
     }
 
@@ -1472,7 +1464,7 @@ public class PluginWifiPrinter extends CordovaPlugin {
                 tgt = cached.trim();
                 Log.i(TAG, "Epson USB using last successful target \"" + tgt + "\"");
             } else {
-                String disc = epsonQuickUsbDiscoveryTarget(ctx, 900);
+                String disc = epsonQuickUsbDiscoveryTarget(ctx, 500);
                 if (disc != null && !disc.isEmpty()) {
                     if (!disc.contains("/dev/")) {
                         tgt = disc;
@@ -1936,20 +1928,20 @@ public class PluginWifiPrinter extends CordovaPlugin {
                     bmp.getWidth(), bmp.getHeight(),
                     Printer.COLOR_1,
                     Printer.MODE_MONO,
-                    Printer.HALFTONE_DITHER,
+                    Printer.HALFTONE_THRESHOLD, // bitmap ถูก dither แล้ว — THRESHOLD เร็วกว่า
                     Printer.PARAM_DEFAULT,
                     Printer.COMPRESS_AUTO);
             printer.addFeedLine(3);
             printer.addCut(Printer.CUT_FEED);
 
             printer.sendData(Printer.PARAM_DEFAULT);
-            sleepQuiet(380);
+            // sendData บล็อกจนข้อมูลถึงเครื่องพิมพ์แล้ว — 50ms พอสำหรับ margin เล็กน้อย
+            sleepQuiet(50);
             try {
                 printer.endTransaction();
             } catch (Exception e) {
                 Log.w(TAG, "Epson USB endTransaction: " + e.getMessage());
             }
-            sleepQuiet(120);
             // *** ไม่ disconnect — เก็บ connection ไว้สำหรับงานพิมพ์ถัดไป ***
             sentOk = true;
         } catch (Epos2Exception e) {
@@ -2044,13 +2036,12 @@ public class PluginWifiPrinter extends CordovaPlugin {
                 }
                 printer.addPulse(Printer.DRAWER_2PIN, Printer.PULSE_100);
                 printer.sendData(Printer.PARAM_DEFAULT);
-                sleepQuiet(400);
+                sleepQuiet(80);
                 try {
                     printer.endTransaction();
                 } catch (Exception e) {
                     Log.w(TAG, "Epson drawer endTransaction: " + e.getMessage());
                 }
-                sleepQuiet(150);
                 // *** ไม่ disconnect — เก็บ connection ไว้ ***
                 ok = true;
             } catch (Epos2Exception e) {
