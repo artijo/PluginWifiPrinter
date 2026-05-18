@@ -1229,8 +1229,7 @@ public class PluginWifiPrinter extends CordovaPlugin {
                     try {
                         JSONObject o = new JSONObject();
                         o.put("brand", "epson");
-                        String rawTgt = safeStr(info.getTarget());
-                        o.put("target", normalizeEpsonUsbConnectTarget(rawTgt));
+                        o.put("target", safeStr(info.getTarget()));
                         o.put("deviceName", safeStr(info.getDeviceName()));
                         o.put("ipAddress", safeStr(info.getIpAddress()));
                         o.put("macAddress", safeStr(info.getMacAddress()));
@@ -1370,161 +1369,21 @@ public class PluginWifiPrinter extends CordovaPlugin {
     }
 
     /**
-     * ปิดการเชื่อมต่อ Epson USB แบบปลอดภัย — เรียกครั้งเดียวต่อ job
-     * ห้ามเรียก clearCommandBuffer หลัง disconnect (บน TM-T82II ทำให้ SDK/USB ค้าง พิมพ์ครั้งถัดไปล้มเหลว)
+     * ปิดการเชื่อมต่อ Epson USB แบบปลอดภัย — เรียกครั้งเดียวต่อ job (อย่า disconnect ซ้ำใน try แล้วซ้ำใน finally)
      */
     private static void releaseEpsonPrinterUsb(Printer printer) {
         if (printer == null) return;
         try {
             try {
-                printer.endTransaction();
-            } catch (Exception e) {
-                Log.w(TAG, "Epson USB endTransaction(release): " + e.getMessage());
-            }
-            try {
-                printer.clearCommandBuffer();
-            } catch (Exception e) {
-                Log.w(TAG, "Epson USB clearCommandBuffer(pre-disconnect): " + e.getMessage());
-            }
-            sleepQuiet(100);
-            try {
                 printer.disconnect();
             } catch (Exception e) {
                 Log.w(TAG, "Epson USB disconnect: " + e.getMessage());
             }
-            // รอให้ USB stack ปลดก่อน open session ใหม่ (ลด ERR_IN_USE / ERR_CONNECT ครั้งถัดไป)
-            sleepQuiet(800);
+            sleepQuiet(280);
+            printer.clearCommandBuffer();
         } catch (Throwable t) {
             Log.w(TAG, "Epson USB release cleanup: " + t.getMessage());
         }
-    }
-
-    /**
-     * ePOS2 ใช้ target จาก Discovery เช่น "USB:xxxxxxxx" หรือ "USB:" เมื่อมีเครื่อง USB Epson เดียว
-     * รูปแบบ "USB:/dev/bus/usb/..." (เอา prefix USB: ต่อกับ path ของ Android) ไม่ถูกต้อง — มักพิมพ์รอบแรกได้แล้วรอบถัดล้มเหลว
-     */
-    private static String normalizeEpsonUsbConnectTarget(String target) {
-        if (target == null) return "USB:";
-        String t = target.trim();
-        if (t.isEmpty()) return "USB:";
-        if (t.regionMatches(true, 0, "USB:", 0, 4)) {
-            String rest = t.length() > 4 ? t.substring(4).trim() : "";
-            if (rest.startsWith("/dev/")) {
-                Log.w(TAG, "Epson USB: connect target was USB:+Android dev path — using \"USB:\"");
-                return "USB:";
-            }
-        }
-        if (t.startsWith("/dev/bus/usb/") || t.startsWith("/dev/usb/")) {
-            Log.w(TAG, "Epson USB: bare Android dev path — ePOS2 expects Discovery target; using \"USB:\"");
-            return "USB:";
-        }
-        return t;
-    }
-
-    /**
-     * Discovery แบบสั้น — เอา target ตัวแรกจาก ePOS2 (ใช้เมื่อ "USB:" ล้มเหลวหรือ ERR_CONNECT)
-     */
-    private static String epsonQuickUsbDiscoveryTarget(Context ctx, long maxWaitMs) {
-        final String[] holder = new String[1];
-        final CountDownLatch latch = new CountDownLatch(1);
-        try {
-            FilterOption opt = new FilterOption();
-            opt.setPortType(Discovery.PORTTYPE_USB);
-            opt.setDeviceType(Discovery.TYPE_PRINTER);
-            DiscoveryListener listener = new DiscoveryListener() {
-                @Override
-                public void onDiscovery(DeviceInfo info) {
-                    try {
-                        if (holder[0] != null) return;
-                        String raw = safeStr(info.getTarget());
-                        if (raw.isEmpty()) return;
-                        holder[0] = normalizeEpsonUsbConnectTarget(raw);
-                        latch.countDown();
-                    } catch (Throwable ignored) {}
-                }
-            };
-            Discovery.start(ctx, opt, listener);
-            latch.await(maxWaitMs, TimeUnit.MILLISECONDS);
-        } catch (Throwable t) {
-            Log.w(TAG, "epsonQuickUsbDiscoveryTarget: " + t.getMessage());
-        } finally {
-            try {
-                Discovery.stop();
-            } catch (Throwable ignored) {}
-        }
-        return holder[0];
-    }
-
-    /**
-     * สร้าง Printer แล้ว connect แบบมี retry — รหัส 2 = ERR_CONNECT, 8 = ERR_IN_USE (จาก Epos2Exception)
-     */
-    private static Printer epsonUsbCreateAndConnect(int series, Context ctx, String tgtRaw) throws Epos2Exception {
-        String tgt = normalizeEpsonUsbConnectTarget(tgtRaw);
-        String trimmedRaw = tgtRaw == null ? "" : tgtRaw.trim();
-        if (!trimmedRaw.equals(tgt)) {
-            Log.i(TAG, "Epson USB connect: normalized \"" + tgtRaw + "\" -> \"" + tgt + "\"");
-        }
-        // "USB:" อย่างเดียวบนอุปกรณ์บางรุ่นได้ ERR_CONNECT — ลองดึง target จาก Discovery ก่อน
-        if ("USB:".equals(tgt)) {
-            String disc = epsonQuickUsbDiscoveryTarget(ctx, 2800);
-            if (disc != null && !disc.isEmpty()) {
-                tgt = disc;
-                Log.i(TAG, "Epson USB pre-connect discovery -> \"" + tgt + "\"");
-            }
-        }
-
-        Epos2Exception last = null;
-        Printer printer = null;
-        for (int attempt = 0; attempt < 4; attempt++) {
-            if (printer != null) {
-                releaseEpsonPrinterUsb(printer);
-                printer = null;
-            }
-            if (attempt > 0) {
-                sleepQuiet(400L * attempt);
-            }
-            printer = new Printer(series, Printer.MODEL_ANK, ctx);
-            try {
-                printer.connect(tgt, Printer.PARAM_DEFAULT);
-                return printer;
-            } catch (Epos2Exception e) {
-                last = e;
-                int st = e.getErrorStatus();
-                if (attempt < 3) {
-                    if (st == Epos2Exception.ERR_CONNECT) {
-                        String disc = epsonQuickUsbDiscoveryTarget(ctx, 2200);
-                        if (disc != null && !disc.isEmpty() && !disc.equals(tgt)) {
-                            tgt = disc;
-                            Log.w(TAG, "Epson USB ERR_CONNECT; retry with discovery target \"" + tgt + "\"");
-                        } else {
-                            sleepQuiet(700);
-                        }
-                    } else if (st == Epos2Exception.ERR_IN_USE) {
-                        sleepQuiet(900);
-                    }
-                }
-                Log.w(TAG, "Epson USB connect attempt " + (attempt + 1) + " failed code=" + st);
-            }
-        }
-        if (last != null) {
-            releaseEpsonPrinterUsb(printer);
-            throw last;
-        }
-        throw new IllegalStateException("Epson USB connect failed");
-    }
-
-    /** ข้อความอธิบายรหัส ePOS2 ที่พบบ่อยบน USB (ดูค่าคงที่ใน Epos2Exception) */
-    private static String epsonUsbHintForCode(int code) {
-        if (code == Epos2Exception.ERR_CONNECT) {
-            return "เชื่อมต่อ USB ไม่สำเร็จ — ถอดสายแล้วเสียบใหม่ กดสแกน USB แล้วเลือกเครื่องอีกครั้ง ตรวจสิทธิ์แอป";
-        }
-        if (code == Epos2Exception.ERR_IN_USE) {
-            return "อุปกรณ์ USB กำลังถูกใช้งาน — รอสักครู่แล้วลองใหม่";
-        }
-        if (code == Epos2Exception.ERR_TIMEOUT) {
-            return "หมดเวลาเชื่อมต่อ USB";
-        }
-        return "ดูรหัสใน Epos2Exception (เอกสาร Epson ePOS2)";
     }
 
     /**
@@ -1633,16 +1492,12 @@ public class PluginWifiPrinter extends CordovaPlugin {
         Printer printer = null;
         boolean sentOk = false;
         try {
-            Context permCtx = ctx.getApplicationContext();
-            if (!hasUsbPermissionForTarget(permCtx, target)) {
-                cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
-                return;
-            }
             int series = epsonModelFromString(modelStr);
+            printer = new Printer(series, Printer.MODEL_ANK, ctx);
 
             // Epson target ตัวอย่าง: "USB:000000000000000000" หรือ "USB:" สำหรับเครื่องแรก
             String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
-            printer = epsonUsbCreateAndConnect(series, ctx, tgt);
+            printer.connect(tgt, Printer.PARAM_DEFAULT);
             printer.beginTransaction();
 
             printer.addTextAlign(Printer.ALIGN_CENTER);
@@ -1671,7 +1526,7 @@ public class PluginWifiPrinter extends CordovaPlugin {
         } catch (Epos2Exception e) {
             int code = e.getErrorStatus();
             Log.e(TAG, "Epson USB print error code=" + code, e);
-            cb.error("Epson USB print error: code=" + code + " — " + epsonUsbHintForCode(code));
+            cb.error("Epson USB print error: code=" + code);
         } catch (Exception e) {
             Log.e(TAG, "Epson USB print error: " + e.getMessage(), e);
             cb.error("Epson USB print error: " + e.getMessage());
@@ -1732,14 +1587,10 @@ public class PluginWifiPrinter extends CordovaPlugin {
         Printer printer = null;
         boolean ok = false;
         try {
-            Context permCtx = ctx.getApplicationContext();
-            if (!hasUsbPermissionForTarget(permCtx, target)) {
-                cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
-                return;
-            }
             int series = epsonModelFromString(modelStr);
+            printer = new Printer(series, Printer.MODEL_ANK, ctx);
             String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
-            printer = epsonUsbCreateAndConnect(series, ctx, tgt);
+            printer.connect(tgt, Printer.PARAM_DEFAULT);
             printer.beginTransaction();
             printer.addPulse(Printer.DRAWER_2PIN, Printer.PULSE_100);
             printer.sendData(Printer.PARAM_DEFAULT);
@@ -1754,7 +1605,7 @@ public class PluginWifiPrinter extends CordovaPlugin {
         } catch (Epos2Exception e) {
             int code = e.getErrorStatus();
             Log.e(TAG, "openCashDrawerUsb (epson) code=" + code, e);
-            cb.error("Epson open drawer error: code=" + code + " — " + epsonUsbHintForCode(code));
+            cb.error("Epson open drawer error: code=" + code);
         } catch (Exception e) {
             Log.e(TAG, "openCashDrawerUsb (epson) error: " + e.getMessage(), e);
             cb.error("Epson open drawer error: " + e.getMessage());
@@ -1780,14 +1631,10 @@ public class PluginWifiPrinter extends CordovaPlugin {
                 Printer printer = null;
                 boolean ok = false;
                 try {
-                    Context permCtx = ctx.getApplicationContext();
-                    if (!hasUsbPermissionForTarget(permCtx, target)) {
-                        cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
-                        return;
-                    }
                     int series = epsonModelFromString(modelStr);
+                    printer = new Printer(series, Printer.MODEL_ANK, ctx);
                     String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
-                    printer = epsonUsbCreateAndConnect(series, ctx, tgt);
+                    printer.connect(tgt, Printer.PARAM_DEFAULT);
                     printer.clearCommandBuffer();
                     sleepQuiet(200);
                     ok = true;
