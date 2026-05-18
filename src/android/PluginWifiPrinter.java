@@ -110,10 +110,23 @@ public class PluginWifiPrinter extends CordovaPlugin {
         return new String[]{host, Integer.toString(port)};
     }
 
+    /**
+     * ePOS2 ต้องใช้ Application context ตามเอกสาร Epson — ห้ามส่ง Activity เข้า Printer
+     */
+    private Context getAppCtxForEpson() {
+        Activity a = cordova.getActivity();
+        if (a != null) {
+            return a.getApplicationContext();
+        }
+        Context c = cordova.getContext();
+        return c != null ? c.getApplicationContext() : null;
+    }
+
     @Override
     public void pluginInitialize() {
         super.pluginInitialize();
-        ensurePosSdkInit();
+        // ไม่เรียก ensurePosSdkInit() ที่นี่ — Xprinter POSConnect.init จะไปแย่ง USB stack กับ ePOS2
+        // ให้ init เฉพาะตอนใช้เส้นทาง Xprinter/LAN เท่านั้น
     }
 
     @Override
@@ -1150,6 +1163,18 @@ public class PluginWifiPrinter extends CordovaPlugin {
             try {
                 Context ctx = cordova.getActivity().getApplicationContext();
 
+                // --- Epson ก่อน — POSConnect.getUsbDevice อาจถือ USB ก่อน ePOS2 ทำให้ ERR_CONNECT ---
+                if ("epson".equals(wanted) || "all".equals(wanted) || "auto".equals(wanted)) {
+                    try {
+                        List<JSONObject> found = epsonDiscoverUsb(ctx);
+                        for (JSONObject o : found) {
+                            printers.put(o);
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "Epson listUsb failed: " + t.getMessage());
+                    }
+                }
+
                 // --- Xprinter side --------------------------------------------------
                 if ("xprinter".equals(wanted) || "all".equals(wanted) || "auto".equals(wanted)) {
                     try {
@@ -1175,18 +1200,6 @@ public class PluginWifiPrinter extends CordovaPlugin {
                         }
                     } catch (Throwable t) {
                         Log.w(TAG, "Xprinter listUsb failed: " + t.getMessage());
-                    }
-                }
-
-                // --- Epson side -----------------------------------------------------
-                if ("epson".equals(wanted) || "all".equals(wanted) || "auto".equals(wanted)) {
-                    try {
-                        List<JSONObject> found = epsonDiscoverUsb(ctx);
-                        for (JSONObject o : found) {
-                            printers.put(o);
-                        }
-                    } catch (Throwable t) {
-                        Log.w(TAG, "Epson listUsb failed: " + t.getMessage());
                     }
                 }
 
@@ -1485,6 +1498,8 @@ public class PluginWifiPrinter extends CordovaPlugin {
             }
             printer = new Printer(series, Printer.MODEL_ANK, ctx);
             try {
+                Log.i(TAG, "Epson USB Printer.connect attempt=" + (attempt + 1)
+                        + " target=\"" + tgt + "\" series=" + series);
                 printer.connect(tgt, Printer.PARAM_DEFAULT);
                 return printer;
             } catch (Epos2Exception e) {
@@ -1628,13 +1643,15 @@ public class PluginWifiPrinter extends CordovaPlugin {
     /** ส่งภาพไปยังเครื่อง Epson ผ่าน USB ด้วย ePOS2 Printer + addImage */
     private void printBitmapEpsonUsb(String target, Bitmap bmp, int widthPx,
                                      String modelStr, CallbackContext cb) {
-        Activity act = cordova.getActivity();
-        Context ctx = act != null ? act : cordova.getContext();
+        Context appCtx = getAppCtxForEpson();
+        if (appCtx == null) {
+            cb.error("Epson USB: ไม่พบ Application context");
+            return;
+        }
         Printer printer = null;
         boolean sentOk = false;
         try {
-            Context permCtx = ctx.getApplicationContext();
-            if (!hasUsbPermissionForTarget(permCtx, target)) {
+            if (!hasUsbPermissionForTarget(appCtx, target)) {
                 cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
                 return;
             }
@@ -1642,7 +1659,7 @@ public class PluginWifiPrinter extends CordovaPlugin {
 
             // Epson target ตัวอย่าง: "USB:000000000000000000" หรือ "USB:" สำหรับเครื่องแรก
             String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
-            printer = epsonUsbCreateAndConnect(series, ctx, tgt);
+            printer = epsonUsbCreateAndConnect(series, appCtx, tgt);
             printer.beginTransaction();
 
             printer.addTextAlign(Printer.ALIGN_CENTER);
@@ -1727,19 +1744,21 @@ public class PluginWifiPrinter extends CordovaPlugin {
     }
 
     private void openCashDrawerEpsonUsb(String target, String modelStr, CallbackContext cb) {
-        Activity act = cordova.getActivity();
-        Context ctx = act != null ? act : cordova.getContext();
+        Context appCtx = getAppCtxForEpson();
+        if (appCtx == null) {
+            cb.error("Epson USB: ไม่พบ Application context");
+            return;
+        }
         Printer printer = null;
         boolean ok = false;
         try {
-            Context permCtx = ctx.getApplicationContext();
-            if (!hasUsbPermissionForTarget(permCtx, target)) {
+            if (!hasUsbPermissionForTarget(appCtx, target)) {
                 cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
                 return;
             }
             int series = epsonModelFromString(modelStr);
             String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
-            printer = epsonUsbCreateAndConnect(series, ctx, tgt);
+            printer = epsonUsbCreateAndConnect(series, appCtx, tgt);
             printer.beginTransaction();
             printer.addPulse(Printer.DRAWER_2PIN, Printer.PULSE_100);
             printer.sendData(Printer.PARAM_DEFAULT);
@@ -1775,19 +1794,21 @@ public class PluginWifiPrinter extends CordovaPlugin {
         final String b = brand == null ? "" : brand.toLowerCase(Locale.ROOT);
         cordova.getThreadPool().execute(() -> {
             if ("epson".equals(b)) {
-                Activity act = cordova.getActivity();
-                Context ctx = act != null ? act : cordova.getContext();
+                Context appCtx = getAppCtxForEpson();
+                if (appCtx == null) {
+                    cb.error("Epson USB: ไม่พบ Application context");
+                    return;
+                }
                 Printer printer = null;
                 boolean ok = false;
                 try {
-                    Context permCtx = ctx.getApplicationContext();
-                    if (!hasUsbPermissionForTarget(permCtx, target)) {
+                    if (!hasUsbPermissionForTarget(appCtx, target)) {
                         cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
                         return;
                     }
                     int series = epsonModelFromString(modelStr);
                     String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
-                    printer = epsonUsbCreateAndConnect(series, ctx, tgt);
+                    printer = epsonUsbCreateAndConnect(series, appCtx, tgt);
                     printer.clearCommandBuffer();
                     sleepQuiet(200);
                     ok = true;
