@@ -44,6 +44,57 @@
 
 @end
 
+#if DELTAFOOD_HAS_EPSON
+/**
+ * Map model string (e.g. "TM_T82", "TM_T82X", "TM-T82") to Epson series enum.
+ * Defaults to EPOS2_TM_T82.
+ */
+static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
+    if (modelStr == nil) return EPOS2_TM_T82;
+    NSString *s = [[modelStr uppercaseString]
+                   stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
+    s = [s stringByReplacingOccurrencesOfString:@" " withString:@""];
+    if ([s hasPrefix:@"TM_T82"]) return EPOS2_TM_T82;
+    if ([s hasPrefix:@"TM_T88"]) return EPOS2_TM_T88;
+    if ([s hasPrefix:@"TM_T20"]) return EPOS2_TM_T20;
+    if ([s hasPrefix:@"TM_T70"]) return EPOS2_TM_T70;
+    if ([s hasPrefix:@"TM_T81"]) return EPOS2_TM_T81;
+    if ([s hasPrefix:@"TM_T83"]) return EPOS2_TM_T83;
+    if ([s hasPrefix:@"TM_T90"]) return EPOS2_TM_T90;
+    if ([s hasPrefix:@"TM_T100"]) return EPOS2_TM_T100;
+    if ([s hasPrefix:@"TM_M10"]) return EPOS2_TM_M10;
+    if ([s hasPrefix:@"TM_M30III"]) return EPOS2_TM_M30III;
+    if ([s hasPrefix:@"TM_M30II"]) return EPOS2_TM_M30II;
+    if ([s hasPrefix:@"TM_M30"]) return EPOS2_TM_M30;
+    if ([s hasPrefix:@"TM_M50"]) return EPOS2_TM_M50;
+    if ([s hasPrefix:@"TM_P20"]) return EPOS2_TM_P20;
+    if ([s hasPrefix:@"TM_P60II"]) return EPOS2_TM_P60II;
+    if ([s hasPrefix:@"TM_P60"]) return EPOS2_TM_P60;
+    if ([s hasPrefix:@"TM_P80"]) return EPOS2_TM_P80;
+    return EPOS2_TM_T82;
+}
+
+/**
+ * Internal delegate for collecting Epson USB Discovery results.
+ */
+@interface DeltafoodEpsonDiscoveryDelegate : NSObject<Epos2DiscoveryDelegate>
+@property (nonatomic, strong) NSMutableArray<Epos2DeviceInfo*> *devices;
+@end
+@implementation DeltafoodEpsonDiscoveryDelegate
+- (instancetype)init {
+    if ((self = [super init])) {
+        _devices = [NSMutableArray array];
+    }
+    return self;
+}
+- (void)onDiscovery:(Epos2DeviceInfo *)deviceInfo {
+    @synchronized (self.devices) {
+        [self.devices addObject:deviceInfo];
+    }
+}
+@end
+#endif
+
 @implementation PluginWifiPrinter
 
 #pragma mark - Public Methods
@@ -628,57 +679,6 @@
 }
 
 #pragma mark - USB (Epson MFi)
-
-#if DELTAFOOD_HAS_EPSON
-/**
- * Map model string (e.g. "TM_T82", "TM_T82X", "TM-T82") to Epson series enum.
- * Defaults to EPOS2_TM_T82.
- */
-static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
-    if (modelStr == nil) return EPOS2_TM_T82;
-    NSString *s = [[modelStr uppercaseString]
-                   stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
-    s = [s stringByReplacingOccurrencesOfString:@" " withString:@""];
-    if ([s hasPrefix:@"TM_T82"]) return EPOS2_TM_T82;
-    if ([s hasPrefix:@"TM_T88"]) return EPOS2_TM_T88;
-    if ([s hasPrefix:@"TM_T20"]) return EPOS2_TM_T20;
-    if ([s hasPrefix:@"TM_T70"]) return EPOS2_TM_T70;
-    if ([s hasPrefix:@"TM_T81"]) return EPOS2_TM_T81;
-    if ([s hasPrefix:@"TM_T83"]) return EPOS2_TM_T83;
-    if ([s hasPrefix:@"TM_T90"]) return EPOS2_TM_T90;
-    if ([s hasPrefix:@"TM_T100"]) return EPOS2_TM_T100;
-    if ([s hasPrefix:@"TM_M10"]) return EPOS2_TM_M10;
-    if ([s hasPrefix:@"TM_M30III"]) return EPOS2_TM_M30III;
-    if ([s hasPrefix:@"TM_M30II"]) return EPOS2_TM_M30II;
-    if ([s hasPrefix:@"TM_M30"]) return EPOS2_TM_M30;
-    if ([s hasPrefix:@"TM_M50"]) return EPOS2_TM_M50;
-    if ([s hasPrefix:@"TM_P20"]) return EPOS2_TM_P20;
-    if ([s hasPrefix:@"TM_P60II"]) return EPOS2_TM_P60II;
-    if ([s hasPrefix:@"TM_P60"]) return EPOS2_TM_P60;
-    if ([s hasPrefix:@"TM_P80"]) return EPOS2_TM_P80;
-    return EPOS2_TM_T82;
-}
-
-/**
- * Internal delegate for collecting Epson USB Discovery results.
- */
-@interface DeltafoodEpsonDiscoveryDelegate : NSObject<Epos2DiscoveryDelegate>
-@property (nonatomic, strong) NSMutableArray<Epos2DeviceInfo*> *devices;
-@end
-@implementation DeltafoodEpsonDiscoveryDelegate
-- (instancetype)init {
-    if ((self = [super init])) {
-        _devices = [NSMutableArray array];
-    }
-    return self;
-}
-- (void)onDiscovery:(Epos2DeviceInfo *)deviceInfo {
-    @synchronized (self.devices) {
-        [self.devices addObject:deviceInfo];
-    }
-}
-@end
-#endif
 
 - (void)requestUsbPermission:(CDVInvokedUrlCommand*)command {
     // iOS/iPadOS ไม่มี Android UsbManager + dialog อนุญาตแบบเดียวกัน — Epson MFi ใช้สิทธิ์ระดับระบบ
