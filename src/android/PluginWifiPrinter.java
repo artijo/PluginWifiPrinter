@@ -256,7 +256,8 @@ public class PluginWifiPrinter extends CordovaPlugin {
                         return;
                     }
 
-                    new POSPrinter(conn).openCashBox(POSConst.PIN_TWO);
+                    pulseXprinterCashDrawer(new POSPrinter(conn));
+                    sleepQuiet(200);
                     callbackContext.success("✅ เปิดลิ้นชักเก็บเงินสำเร็จ");
                     Log.i(TAG, "✅ openCashDrawer (SDK) " + addr);
                 } catch (Exception e) {
@@ -1975,29 +1976,45 @@ public class PluginWifiPrinter extends CordovaPlugin {
         });
     }
 
+    /**
+     * ส่ง pulse เปิดลิ้นชัก Xprinter — ลองทั้ง PIN 2 และ PIN 5
+     * (Xprinter หลายรุ่น/สาย RJ11 ต่อคนละ pin; USB บน Android 7 ต้องรอ flush ก่อนปิด connection)
+     */
+    private static void pulseXprinterCashDrawer(POSPrinter printer) throws Exception {
+        printer.initializePrinter();
+        printer.openCashBox(POSConst.PIN_TWO);
+        sleepQuiet(80);
+        printer.openCashBox(POSConst.PIN_FIVE);
+    }
+
     private void openCashDrawerXprinterUsb(String target, CallbackContext cb) {
         ensurePosSdkInit();
-        IDeviceConnection conn = null;
-        try {
-            Context ctx = cordova.getActivity().getApplicationContext();
-            if (!hasUsbPermissionForTarget(ctx, target)) {
-                cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
-                return;
-            }
-            conn = POSConnect.createDevice(POSConnect.DEVICE_TYPE_USB);
-            if (!conn.connectSync(target, EMPTY_POS_LISTENER)) {
-                cb.error("เชื่อมต่อ USB เครื่องพิมพ์ไม่สำเร็จ");
-                return;
-            }
-            new POSPrinter(conn).openCashBox(POSConst.PIN_TWO);
-            try { Thread.sleep(150); } catch (InterruptedException ignored) {}
-            cb.success("✅ เปิดลิ้นชักเก็บเงินสำเร็จ");
-        } catch (Exception e) {
-            Log.e(TAG, "openCashDrawerUsb (xprinter) error: " + e.getMessage(), e);
-            cb.error("เปิดลิ้นชักล้มเหลว: " + e.getMessage());
-        } finally {
-            if (conn != null) {
-                try { conn.closeSync(); } catch (Exception ignored) {}
+        final String lockKey = "usb:" + target;
+        synchronized (printerLocks.computeIfAbsent(lockKey, k -> new Object())) {
+            IDeviceConnection conn = null;
+            try {
+                Context ctx = cordova.getActivity().getApplicationContext();
+                if (!hasUsbPermissionForTarget(ctx, target)) {
+                    cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
+                    return;
+                }
+                conn = POSConnect.createDevice(POSConnect.DEVICE_TYPE_USB);
+                if (!conn.connectSync(target, EMPTY_POS_LISTENER)) {
+                    cb.error("เชื่อมต่อ USB เครื่องพิมพ์ไม่สำเร็จ");
+                    return;
+                }
+                pulseXprinterCashDrawer(new POSPrinter(conn));
+                // USB bulk transfer บน Android 7 (Sunmi) ต้องรอให้คำสั่งออกก่อน closeSync — 150ms ไม่พอ
+                sleepQuiet(400);
+                cb.success("✅ เปิดลิ้นชักเก็บเงินสำเร็จ");
+                Log.i(TAG, "✅ openCashDrawerUsb (xprinter) " + target);
+            } catch (Exception e) {
+                Log.e(TAG, "openCashDrawerUsb (xprinter) error: " + e.getMessage(), e);
+                cb.error("เปิดลิ้นชักล้มเหลว: " + e.getMessage());
+            } finally {
+                if (conn != null) {
+                    try { conn.closeSync(); } catch (Exception ignored) {}
+                }
             }
         }
     }
