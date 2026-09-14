@@ -151,7 +151,8 @@ exports.printBitmapToSpi = function (spiDevicePath, base64Data, paperWidth, succ
 /**
  * รายการอุปกรณ์ USB ที่เห็นอยู่ตอนนี้
  * @param {string} brand  "xprinter"|"epson"|"all" (default "all")
- * @returns success({ printers: [{brand,target,deviceName,vendorId,productId,...}] })
+ * @returns success({ printers: [{brand,target,identity,devicePath,vendorId,productId,serialNumber,...}] })
+ * target/identity เป็น id:VID:PID:SERIAL คงที่ — ไม่ใช้เลขพอร์ต /dev/bus/usb ที่เปลี่ยนทุกครั้งที่ถอดเสียบ
  */
 exports.listUsbPrinters = function (brand, success, error) {
   if (typeof brand === 'function') {
@@ -177,7 +178,7 @@ exports.listUsbPrinters = function (brand, success, error) {
 
 /**
  * ขอสิทธิ์เข้าถึงอุปกรณ์ USB (Android เท่านั้น — ครั้งแรกจะเห็น dialog ระบบ)
- * @param {string} target  devicePath เช่น "/dev/bus/usb/001/003" หรือ "USB:..." (Epson)
+ * @param {string} target  identity เช่น "id:1305:7000:" หรือ path เก่า / "USB:..." (Epson)
  * @returns success("granted"|"already") | error(message)
  */
 exports.requestUsbPermission = function (target, success, error) {
