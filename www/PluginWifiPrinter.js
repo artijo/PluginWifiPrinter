@@ -252,3 +252,31 @@ exports.clearPrinterQueueUsb = function (brand, target, model, success, error) {
   );
 };
 
+/**
+ * รายการ USB ที่เสียบอยู่ตอนนี้ (UsbManager อย่างเดียว ไม่รอ Epson Discovery)
+ */
+exports.listAttachedUsbDevices = function (success, error) {
+  exec(
+    function (res) {
+      var parsed = res;
+      if (typeof res === 'string') {
+        try { parsed = JSON.parse(res); }
+        catch (e) { parsed = { devices: [] }; }
+      }
+      success && success(parsed && parsed.devices ? parsed.devices : []);
+    },
+    function (err) { error && error(err); },
+    'PluginWifiPrinter',
+    'listAttachedUsbDevices',
+    []
+  );
+};
+
+/**
+ * ฟัง USB ถูกเสียบ/ถอด — keep callback
+ * success({ event: 'snapshot'|'attached'|'detached', device?, devices? })
+ */
+exports.watchUsbAttach = function (success, error) {
+  exec(success, error, 'PluginWifiPrinter', 'watchUsbAttach', []);
+};
+

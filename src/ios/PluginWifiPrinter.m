@@ -6,6 +6,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/select.h>
+#include <string.h>
 
 // Epson ePOS2 SDK — provided as libepos2.xcframework (umbrella header: ePOS2.h)
 // Imported via module to avoid forcing an exact filesystem path. If the import
@@ -369,24 +373,63 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
 }
 
 - (int)connectToPrinter:(NSString*)ip port:(int)port {
+    return [self connectToPrinter:ip port:port timeoutMs:2500];
+}
+
+- (int)connectToPrinter:(NSString*)ip port:(int)port timeoutMs:(int)timeoutMs {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
         NSLog(@"Socket creation failed");
         return -1;
     }
 
+    int nosig = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+    }
+
     struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
     serv_addr.sin_addr.s_addr = inet_addr([ip UTF8String]);
 
     int connectResult = connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
-
-    if (connectResult < 0) {
+    if (connectResult == 0) {
+        if (flags >= 0) fcntl(sockfd, F_SETFL, flags);
+        return sockfd;
+    }
+    if (errno != EINPROGRESS) {
         NSLog(@"Connect to printer %@:%d failed", ip, port);
         close(sockfd);
         return -1;
     }
+
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(sockfd, &wset);
+    struct timeval tv;
+    int ms = timeoutMs > 0 ? timeoutMs : 2500;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    int sel = select(sockfd + 1, NULL, &wset, NULL, &tv);
+    if (sel <= 0) {
+        NSLog(@"Connect to printer %@:%d timed out", ip, port);
+        close(sockfd);
+        return -1;
+    }
+    int so_error = 0;
+    socklen_t len = sizeof(so_error);
+    getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len);
+    if (so_error != 0) {
+        NSLog(@"Connect to printer %@:%d failed err=%d", ip, port, so_error);
+        close(sockfd);
+        return -1;
+    }
+    if (flags >= 0) fcntl(sockfd, F_SETFL, flags);
     return sockfd;
 }
 
@@ -684,6 +727,19 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
     // iOS/iPadOS ไม่มี Android UsbManager + dialog อนุญาตแบบเดียวกัน — Epson MFi ใช้สิทธิ์ระดับระบบ
     // คืนสำเร็จเสมอเพื่อให้ฝั่ง Angular (เลือกเครื่อง → ทดสอบพิมพ์) ไม่ค้าง
     [self sendSuccess:@"already" command:command];
+}
+
+- (void)listAttachedUsbDevices:(CDVInvokedUrlCommand*)command {
+    CDVPluginResult *r = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                      messageAsDictionary:@{ @"devices": @[] }];
+    [self.commandDelegate sendPluginResult:r callbackId:command.callbackId];
+}
+
+- (void)watchUsbAttach:(CDVInvokedUrlCommand*)command {
+    CDVPluginResult *r = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                      messageAsDictionary:@{ @"event": @"snapshot", @"devices": @[] }];
+    [r setKeepCallbackAsBool:YES];
+    [self.commandDelegate sendPluginResult:r callbackId:command.callbackId];
 }
 
 - (void)listUsbPrinters:(CDVInvokedUrlCommand*)command {

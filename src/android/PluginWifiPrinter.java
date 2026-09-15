@@ -87,6 +87,11 @@ public class PluginWifiPrinter extends CordovaPlugin {
 
     private volatile boolean posSdkInited;
 
+    private static volatile PluginWifiPrinter sSelf;
+    private CallbackContext usbWatchCb;
+    private BroadcastReceiver usbAttachReceiver;
+    private final Set<String> lastUsbDeviceNames = new HashSet<>();
+
     private static final IConnectListener EMPTY_POS_LISTENER =
             (code, connInfo, msg) ->
                     Log.d(TAG, "POSConnect listener: code=" + code + " info=" + connInfo + " msg=" + msg);
@@ -153,8 +158,29 @@ public class PluginWifiPrinter extends CordovaPlugin {
     @Override
     public void pluginInitialize() {
         super.pluginInitialize();
+        sSelf = this;
+        snapshotUsbDeviceNames();
+        ensureUsbAttachReceiver();
         // ห้าม ensurePosSdkInit() ที่นี่ — Xprinter POSConnect แย่ง USB กับ ePOS2 ทำให้พิมพ์ Epson รอบสองได้ ERR_CONNECT
     }
+
+    @Override
+    public void onResume(boolean multitasking) {
+        super.onResume(multitasking);
+        emitUsbAttachDiff();
+    }
+
+    @Override
+    public void onDestroy() {
+        unregisterUsbAttachReceiver();
+        if (sSelf == this) sSelf = null;
+        usbWatchCb = null;
+        super.onDestroy();
+    }
+
+    /** MainActivity ส่งต่อเมื่อระบบเปิดแอปด้วย USB_DEVICE_ATTACHED */
+    private static final String ACTION_APP_USB_PRINTER_ATTACHED =
+            "me.deltafood.v2.USB_PRINTER_ATTACHED";
 
     @Override
     public boolean execute(String action, JSONArray args, CallbackContext callbackContext) throws JSONException {
@@ -228,10 +254,187 @@ public class PluginWifiPrinter extends CordovaPlugin {
             String modelStr = args.optString(2, "");
             clearPrinterQueueUsb(brand, target, modelStr, callbackContext);
             return true;
+        } else if ("listAttachedUsbDevices".equals(action)) {
+            listAttachedUsbDevices(callbackContext);
+            return true;
+        } else if ("watchUsbAttach".equals(action)) {
+            watchUsbAttach(callbackContext);
+            return true;
         }
 
         Log.w(TAG, "Unknown action: " + action);
         return false;
+    }
+
+    private void listAttachedUsbDevices(CallbackContext cb) {
+        cordova.getThreadPool().execute(() -> {
+            try {
+                JSONObject result = new JSONObject();
+                result.put("devices", collectAttachedUsbPrinterJson());
+                cb.success(result);
+            } catch (Exception e) {
+                cb.error("listAttachedUsbDevices: " + e.getMessage());
+            }
+        });
+    }
+
+    private void watchUsbAttach(CallbackContext cb) {
+        usbWatchCb = cb;
+        ensureUsbAttachReceiver();
+        try {
+            JSONObject ready = new JSONObject();
+            ready.put("event", "snapshot");
+            ready.put("devices", collectAttachedUsbPrinterJson());
+            PluginResult r = new PluginResult(PluginResult.Status.OK, ready);
+            r.setKeepCallback(true);
+            cb.sendPluginResult(r);
+        } catch (Exception e) {
+            PluginResult r = new PluginResult(PluginResult.Status.NO_RESULT);
+            r.setKeepCallback(true);
+            cb.sendPluginResult(r);
+        }
+    }
+
+    private JSONArray collectAttachedUsbPrinterJson() {
+        JSONArray arr = new JSONArray();
+        Context ctx = getAppCtxForEpson();
+        if (ctx == null) return arr;
+        UsbManager um = (UsbManager) ctx.getSystemService(Context.USB_SERVICE);
+        if (um == null) return arr;
+        for (UsbDevice d : um.getDeviceList().values()) {
+            if (d == null || isUsbHub(d) || !looksLikeUsbPrinter(d)) continue;
+            try {
+                arr.put(usbDeviceToJson(d, ctx));
+            } catch (JSONException ignored) {}
+        }
+        return arr;
+    }
+
+    private JSONObject usbDeviceToJson(UsbDevice d, Context ctx) throws JSONException {
+        JSONObject o = new JSONObject();
+        String path = d.getDeviceName();
+        String serial = "";
+        String productName = "";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            productName = safeStr(d.getProductName());
+            o.put("productName", productName);
+            o.put("manufacturerName", safeStr(d.getManufacturerName()));
+            serial = safeStrSerial(d, ctx);
+            o.put("serialNumber", serial);
+        }
+        o.put("vendorId", d.getVendorId());
+        o.put("productId", d.getProductId());
+        o.put("identity", buildUsbIdentity(d.getVendorId(), d.getProductId(), serial, productName));
+        o.put("devicePath", path);
+        o.put("deviceName", path);
+        o.put("target", path);
+        o.put("brand", d.getVendorId() == VID_EPSON ? "epson" : "xprinter");
+        return o;
+    }
+
+    private void snapshotUsbDeviceNames() {
+        lastUsbDeviceNames.clear();
+        Context ctx = getAppCtxForEpson();
+        if (ctx == null) return;
+        UsbManager um = (UsbManager) ctx.getSystemService(Context.USB_SERVICE);
+        if (um == null) return;
+        for (UsbDevice d : um.getDeviceList().values()) {
+            if (d != null && d.getDeviceName() != null) {
+                lastUsbDeviceNames.add(d.getDeviceName());
+            }
+        }
+    }
+
+    private void emitUsbAttachDiff() {
+        Context ctx = getAppCtxForEpson();
+        if (ctx == null) return;
+        UsbManager um = (UsbManager) ctx.getSystemService(Context.USB_SERVICE);
+        if (um == null) return;
+        Set<String> now = new HashSet<>();
+        List<UsbDevice> attached = new ArrayList<>();
+        for (UsbDevice d : um.getDeviceList().values()) {
+            if (d == null || d.getDeviceName() == null) continue;
+            now.add(d.getDeviceName());
+            if (!lastUsbDeviceNames.contains(d.getDeviceName())
+                    && !isUsbHub(d) && looksLikeUsbPrinter(d)) {
+                attached.add(d);
+            }
+        }
+        lastUsbDeviceNames.clear();
+        lastUsbDeviceNames.addAll(now);
+        for (UsbDevice d : attached) {
+            emitUsbEvent("attached", d);
+        }
+    }
+
+    private void emitUsbEvent(String event, UsbDevice device) {
+        if (device != null && "attached".equals(event)) {
+            lastUsbDeviceNames.add(device.getDeviceName());
+        }
+        if (device != null && "detached".equals(event)) {
+            lastUsbDeviceNames.remove(device.getDeviceName());
+            invalidateEpsonUsbPrinter();
+        }
+        if (usbWatchCb == null) return;
+        try {
+            JSONObject o = new JSONObject();
+            o.put("event", event);
+            Context ctx = getAppCtxForEpson();
+            if (device != null && ctx != null) {
+                o.put("device", usbDeviceToJson(device, ctx));
+            }
+            PluginResult r = new PluginResult(PluginResult.Status.OK, o);
+            r.setKeepCallback(true);
+            usbWatchCb.sendPluginResult(r);
+        } catch (Exception e) {
+            Log.w(TAG, "emitUsbEvent: " + e.getMessage());
+        }
+    }
+
+    private void ensureUsbAttachReceiver() {
+        if (usbAttachReceiver != null) return;
+        final Activity activity = cordova.getActivity();
+        if (activity == null) return;
+        usbAttachReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (intent == null || intent.getAction() == null) return;
+                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(intent.getAction())
+                        || ACTION_APP_USB_PRINTER_ATTACHED.equals(intent.getAction())) {
+                    if (device != null && !isUsbHub(device) && looksLikeUsbPrinter(device)) {
+                        emitUsbEvent("attached", device);
+                    }
+                } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(intent.getAction())) {
+                    emitUsbEvent("detached", device);
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+        filter.addAction(ACTION_APP_USB_PRINTER_ATTACHED);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                activity.registerReceiver(usbAttachReceiver, filter, Context.RECEIVER_EXPORTED);
+            } else {
+                activity.registerReceiver(usbAttachReceiver, filter);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "register USB receiver: " + e.getMessage());
+            usbAttachReceiver = null;
+        }
+    }
+
+    private void unregisterUsbAttachReceiver() {
+        if (usbAttachReceiver == null) return;
+        try {
+            Activity activity = cordova.getActivity();
+            if (activity != null) {
+                activity.unregisterReceiver(usbAttachReceiver);
+            }
+        } catch (Exception ignored) {}
+        usbAttachReceiver = null;
     }
 
     // เปิดลิ้นชักเก็บเงิน — Xprinter POS SDK (LAN/TCP)
@@ -1206,15 +1409,17 @@ public class PluginWifiPrinter extends CordovaPlugin {
                                 o.put("brand", "xprinter");
                                 String path = d.getDeviceName();
                                 String serial = "";
+                                String productName = "";
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                                    o.put("productName", safeStr(d.getProductName()));
+                                    productName = safeStr(d.getProductName());
+                                    o.put("productName", productName);
                                     o.put("manufacturerName", safeStr(d.getManufacturerName()));
                                     serial = safeStrSerial(d, ctx);
                                     o.put("serialNumber", serial);
                                 }
                                 o.put("vendorId", d.getVendorId());
                                 o.put("productId", d.getProductId());
-                                String identity = buildUsbIdentity(d.getVendorId(), d.getProductId(), serial);
+                                String identity = buildUsbIdentity(d.getVendorId(), d.getProductId(), serial, productName);
                                 o.put("identity", identity);
                                 // POSConnect ต้องได้ path จริง — identity เก็บแยกเพื่อ remap หลังถอดเสียบ
                                 o.put("target", path);
@@ -1291,35 +1496,77 @@ public class PluginWifiPrinter extends CordovaPlugin {
 
     /**
      * ตัวระบุคงที่ — Android เปลี่ยนเลขท้ายของ {@code /dev/bus/usb/BBB/DDD} ทุกครั้งที่ถอดเสียบ
-     * (โดยเฉพาะผ่าน USB hub) จึงห้ามใช้ path เป็นคีย์เครื่องพิมพ์
-     * รูปแบบ: {@code id:&lt;vendorId&gt;:&lt;productId&gt;:&lt;serial&gt;}
+     * รูปแบบ: {@code id:VID:PID:SERIAL:PRODUCT} (SERIAL/PRODUCT เป็น URL-encoded)
      */
+    private static String usbIdentEnc(String s) {
+        try {
+            return URLEncoder.encode(s == null ? "" : s.trim(), "UTF-8").replace("+", "%20");
+        } catch (Exception e) {
+            return s == null ? "" : s.trim();
+        }
+    }
+
+    private static String usbIdentDec(String s) {
+        if (s == null || s.isEmpty()) return "";
+        try {
+            return URLDecoder.decode(s, "UTF-8");
+        } catch (Exception e) {
+            return s;
+        }
+    }
+
     private static String buildUsbIdentity(int vid, int pid, String serial) {
-        return "id:" + vid + ":" + pid + ":" + (serial == null ? "" : serial.trim());
+        return buildUsbIdentity(vid, pid, serial, "");
+    }
+
+    private static String buildUsbIdentity(int vid, int pid, String serial, String productName) {
+        return "id:" + vid + ":" + pid + ":" + usbIdentEnc(serial) + ":" + usbIdentEnc(productName);
     }
 
     private static boolean isUsbIdentityTarget(String t) {
         return t != null && t.length() >= 4 && t.regionMatches(true, 0, "id:", 0, 3);
     }
 
-    /** คืน [vid, pid] และ serial ผ่าน serialOut[0] ถ้าเป็นรูปแบบ id:VID:PID:SERIAL */
-    private static int[] parseUsbIdentityVidPid(String t, String[] serialOut) {
+    private static final class UsbIdent {
+        int vid;
+        int pid;
+        String serial = "";
+        String productName = "";
+    }
+
+    private static UsbIdent parseUsbIdentity(String t) {
         if (!isUsbIdentityTarget(t)) return null;
         String rest = t.substring(3);
         int c1 = rest.indexOf(':');
         if (c1 <= 0) return null;
         int c2 = rest.indexOf(':', c1 + 1);
         if (c2 < 0) return null;
+        UsbIdent id = new UsbIdent();
         try {
-            int vid = Integer.parseInt(rest.substring(0, c1).trim());
-            int pid = Integer.parseInt(rest.substring(c1 + 1, c2).trim());
-            if (serialOut != null && serialOut.length > 0) {
-                serialOut[0] = rest.substring(c2 + 1);
-            }
-            return new int[]{vid, pid};
+            id.vid = Integer.parseInt(rest.substring(0, c1).trim());
+            id.pid = Integer.parseInt(rest.substring(c1 + 1, c2).trim());
         } catch (NumberFormatException e) {
             return null;
         }
+        String tail = rest.substring(c2 + 1);
+        int c3 = tail.indexOf(':');
+        if (c3 < 0) {
+            id.serial = usbIdentDec(tail);
+        } else {
+            id.serial = usbIdentDec(tail.substring(0, c3));
+            id.productName = usbIdentDec(tail.substring(c3 + 1));
+        }
+        return id;
+    }
+
+    /** คืน [vid, pid] และ serial ผ่าน serialOut[0] ถ้าเป็นรูปแบบ id:VID:PID:... */
+    private static int[] parseUsbIdentityVidPid(String t, String[] serialOut) {
+        UsbIdent id = parseUsbIdentity(t);
+        if (id == null) return null;
+        if (serialOut != null && serialOut.length > 0) {
+            serialOut[0] = id.serial;
+        }
+        return new int[]{id.vid, id.pid};
     }
 
     private static boolean isUsbHub(UsbDevice d) {
@@ -1424,31 +1671,59 @@ public class PluginWifiPrinter extends CordovaPlugin {
         return out;
     }
 
-    private UsbDevice findUsbByVidPidSerial(UsbManager um, Context ctx, int vid, int pid, String serial) {
-        if (um == null) return null;
+    private List<UsbDevice> usbDevicesMatchingVidPid(UsbManager um, int vid, int pid) {
         List<UsbDevice> matches = new ArrayList<>();
-        String wantSn = serial == null ? "" : serial.trim();
+        if (um == null) return matches;
         for (UsbDevice d : um.getDeviceList().values()) {
             if (d == null || isUsbHub(d)) continue;
-            if (d.getVendorId() != vid || d.getProductId() != pid) continue;
-            if (!wantSn.isEmpty() && serialEquals(wantSn, serialOf(d, ctx))) {
-                return d;
-            }
+            if (d.getVendorId() != vid) continue;
+            if (pid != 0 && d.getProductId() != pid) continue;
             matches.add(d);
         }
+        return matches;
+    }
+
+    private UsbDevice findUsbByVidPidSerial(UsbManager um, Context ctx, int vid, int pid,
+                                            String serial, String productName) {
+        if (um == null) return null;
+        List<UsbDevice> matches = usbDevicesMatchingVidPid(um, vid, pid);
+        String wantSn = serial == null ? "" : serial.trim();
+        String wantPn = productName == null ? "" : productName.trim();
+        if (!wantSn.isEmpty()) {
+            for (UsbDevice d : matches) {
+                if (serialEquals(wantSn, serialOf(d, ctx))) return d;
+            }
+            // มี serial ใน identity แต่ตอนนี้อ่านไม่ได้ — อย่าเดาเครื่องเมื่อมีหลายตัว
+            if (matches.size() == 1) return matches.get(0);
+            return null;
+        }
+        if (matches.isEmpty()) return null;
         if (matches.size() == 1) return matches.get(0);
+        if (!wantPn.isEmpty()) {
+            List<UsbDevice> byName = new ArrayList<>();
+            for (UsbDevice d : matches) {
+                String pn = "";
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    pn = safeStr(d.getProductName());
+                }
+                if (wantPn.equalsIgnoreCase(pn)) byName.add(d);
+            }
+            if (byName.size() == 1) return byName.get(0);
+        }
         List<UsbDevice> printers = new ArrayList<>();
         for (UsbDevice d : matches) {
             if (looksLikeUsbPrinter(d)) printers.add(d);
         }
         if (printers.size() == 1) return printers.get(0);
-        if (printers.size() > 1) return printers.get(0);
-        return matches.isEmpty() ? null : matches.get(0);
+        Log.w(TAG, "USB resolve: " + matches.size() + " devices vid=" + vid + " pid=" + pid
+                + " serial=\"" + wantSn + "\" — not unique");
+        return null;
     }
 
     /**
      * หา UsbDevice จาก target ที่แอปเก็บไว้ — รองรับ path เก่าที่เลขพอร์ตเปลี่ยนหลังถอดเสียบ
      * และรูปแบบคงที่ {@code id:VID:PID:SERIAL}
+     * ไม่ขอสิทธิ์ USB (ใช้เช็ค permission) — ตอนพิมพ์ใช้ {@link #resolveUsbDeviceForPrint}
      */
     private UsbDevice resolveUsbDevice(Context ctx, String target, String brand) {
         if (ctx == null) return null;
@@ -1467,10 +1742,10 @@ public class PluginWifiPrinter extends CordovaPlugin {
                 if (exact != null) return exact;
             }
 
-            String[] sn = new String[]{""};
-            int[] vp = parseUsbIdentityVidPid(t, sn);
-            if (vp != null) {
-                UsbDevice byId = findUsbByVidPidSerial(um, ctx, vp[0], vp[1], sn[0]);
+            UsbIdent ident = parseUsbIdentity(t);
+            if (ident != null) {
+                UsbDevice byId = findUsbByVidPidSerial(um, ctx, ident.vid, ident.pid,
+                        ident.serial, ident.productName);
                 if (byId != null) return byId;
             }
 
@@ -1495,26 +1770,91 @@ public class PluginWifiPrinter extends CordovaPlugin {
                     + printers.get(0).getDeviceName());
             return printers.get(0);
         }
+        return null;
+    }
 
-        String stalePath = androidUsbPathForPermissionLookup(t);
-        if (stalePath == null && t.startsWith("/dev/")) stalePath = t;
-        if (stalePath != null && printers.size() > 1) {
-            int bus = usbBusNumberFromPath(stalePath);
-            if (bus >= 0) {
-                List<UsbDevice> sameBus = new ArrayList<>();
-                for (UsbDevice d : printers) {
-                    if (usbBusNumberFromPath(d.getDeviceName()) == bus) {
-                        sameBus.add(d);
+    /**
+     * หลังถอดเสียบ Android มองเป็นอุปกรณ์ใหม่ — อ่าน serial ไม่ได้จนกว่าจะอนุญาต USB
+     * เมื่อมีหลายเครื่อง ให้ขอสิทธิ์ทีละตัวจนกว่า serial จะตรงกับที่บันทึกไว้
+     */
+    private UsbDevice resolveUsbDeviceForPrint(Context ctx, String target, String brand) {
+        if (ctx == null) return null;
+        UsbManager um = (UsbManager) ctx.getSystemService(Context.USB_SERVICE);
+        if (um == null) return null;
+        String t = target == null ? "" : target.trim();
+        UsbDevice resolved = resolveUsbDevice(ctx, t, brand);
+        UsbIdent ident = parseUsbIdentity(t);
+
+        if (ident != null && ident.serial != null && !ident.serial.trim().isEmpty()) {
+            if (resolved != null) {
+                if (!um.hasPermission(resolved)) {
+                    ensureUsbPermissionBlocking(resolved, 25000);
+                }
+                if (serialEquals(ident.serial, serialOf(resolved, ctx))) {
+                    return resolved;
+                }
+                Log.w(TAG, "USB resolve: guessed " + resolved.getDeviceName()
+                        + " serial mismatch for " + t);
+                resolved = null;
+            }
+            List<UsbDevice> candidates = usbDevicesMatchingVidPid(um, ident.vid, ident.pid);
+            for (UsbDevice cand : candidates) {
+                if (um.hasPermission(cand) && serialEquals(ident.serial, serialOf(cand, ctx))) {
+                    return cand;
+                }
+            }
+            for (UsbDevice cand : candidates) {
+                if (um.hasPermission(cand)) continue;
+                Log.i(TAG, "USB resolve: request permission to identify " + cand.getDeviceName());
+                if (!ensureUsbPermissionBlocking(cand, 25000)) continue;
+                if (serialEquals(ident.serial, serialOf(cand, ctx))) {
+                    return cand;
+                }
+            }
+            return null;
+        }
+
+        if (t.regionMatches(true, 0, "USB:", 0, 4)) {
+            String rest = t.length() > 4 ? t.substring(4).trim() : "";
+            if (!rest.isEmpty() && !rest.startsWith("/dev/")) {
+                if (resolved != null) {
+                    if (!um.hasPermission(resolved)) {
+                        ensureUsbPermissionBlocking(resolved, 25000);
+                    }
+                    if (serialEquals(rest, serialOf(resolved, ctx))) return resolved;
+                    resolved = null;
+                }
+                List<UsbDevice> epsons = listPrinterLikeUsbDevices(ctx, um, "epson");
+                for (UsbDevice cand : epsons) {
+                    if (um.hasPermission(cand) && serialEquals(rest, serialOf(cand, ctx))) {
+                        return cand;
                     }
                 }
-                if (sameBus.size() == 1) {
-                    Log.i(TAG, "USB resolve: stale path on bus " + bus + " → "
-                            + sameBus.get(0).getDeviceName());
-                    return sameBus.get(0);
+                for (UsbDevice cand : epsons) {
+                    if (um.hasPermission(cand)) continue;
+                    if (!ensureUsbPermissionBlocking(cand, 25000)) continue;
+                    if (serialEquals(rest, serialOf(cand, ctx))) return cand;
                 }
             }
         }
-        return null;
+
+        if (resolved != null && !um.hasPermission(resolved)) {
+            ensureUsbPermissionBlocking(resolved, 25000);
+        }
+        return resolved;
+    }
+
+    private static String epsonTargetFromIdentityOrDevice(Context ctx, String target, UsbDevice liveDev) {
+        if (liveDev != null) {
+            String sn = serialOf(liveDev, ctx);
+            if (!sn.isEmpty()) return "USB:" + sn;
+        }
+        String t = target == null ? "" : target.trim();
+        UsbIdent ident = parseUsbIdentity(t);
+        if (ident != null && ident.serial != null && !ident.serial.isEmpty()) {
+            return "USB:" + ident.serial;
+        }
+        return t.isEmpty() ? "USB:" : t;
     }
 
     /**
@@ -1584,7 +1924,12 @@ public class PluginWifiPrinter extends CordovaPlugin {
         String t = target.trim();
         if (t.isEmpty()) return "USB:";
         if (isUsbIdentityTarget(t)) {
-            Log.w(TAG, "Epson USB: identity target — using USB:");
+            UsbIdent ident = parseUsbIdentity(t);
+            if (ident != null && ident.serial != null && !ident.serial.isEmpty()) {
+                Log.w(TAG, "Epson USB: identity with serial — using USB:" + ident.serial);
+                return "USB:" + ident.serial;
+            }
+            Log.w(TAG, "Epson USB: identity without serial — using USB:");
             return "USB:";
         }
         if (t.regionMatches(true, 0, "USB:", 0, 4)) {
@@ -1665,8 +2010,15 @@ public class PluginWifiPrinter extends CordovaPlugin {
         if (tgtNorm.regionMatches(true, 0, "USB:", 0, 4)) {
             String rest = tgtNorm.length() > 4 ? tgtNorm.substring(4).trim() : "";
             if (rest.startsWith("/dev/")) tgtNorm = "USB:";
-        } else if (tgtNorm.startsWith("/dev/") || isUsbIdentityTarget(tgtNorm)) {
+        } else if (tgtNorm.startsWith("/dev/")) {
             tgtNorm = "USB:";
+        } else if (isUsbIdentityTarget(tgtNorm)) {
+            UsbIdent ident = parseUsbIdentity(tgtNorm);
+            if (ident != null && ident.serial != null && !ident.serial.isEmpty()) {
+                tgtNorm = "USB:" + ident.serial;
+            } else {
+                tgtNorm = "USB:";
+            }
         }
         // มี persistent printer ที่ตรงกับ target+series → reuse โดยไม่ต้อง connect ใหม่
         if (sEpsonUsbPrinterInstance != null
@@ -1952,8 +2304,13 @@ public class PluginWifiPrinter extends CordovaPlugin {
                             o.put("productId", matched.getProductId());
                             o.put("serialNumber", sn);
                             o.put("devicePath", matched.getDeviceName());
+                            String pn = "";
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                                pn = safeStr(matched.getProductName());
+                                o.put("productName", pn);
+                            }
                             String ident = buildUsbIdentity(
-                                    matched.getVendorId(), matched.getProductId(), sn);
+                                    matched.getVendorId(), matched.getProductId(), sn, pn);
                             o.put("identity", ident);
                             if (rawTgt.contains("/dev/")) {
                                 o.put("target", "USB:");
@@ -1963,7 +2320,7 @@ public class PluginWifiPrinter extends CordovaPlugin {
                         } else {
                             o.put("target", rawTgt.isEmpty() ? "USB:" : rawTgt);
                             if (!epsonSerial.isEmpty()) {
-                                o.put("identity", "id:" + VID_EPSON + ":0:" + epsonSerial);
+                                o.put("identity", buildUsbIdentity(VID_EPSON, 0, epsonSerial, ""));
                             }
                         }
                         synchronized (found) {
@@ -2022,12 +2379,14 @@ public class PluginWifiPrinter extends CordovaPlugin {
                 }
             }
         }
-        // ถ้าเป็น target ของ Epson เช่น "USB:..." → หาจาก vendor list ของ Epson แทน
         if (device == null && target.startsWith("USB:")) {
-            for (UsbDevice d : um.getDeviceList().values()) {
-                if (d.getVendorId() == VID_EPSON) {
-                    device = d;
-                    break;
+            String rest = target.length() > 4 ? target.substring(4).trim() : "";
+            if (!rest.isEmpty() && !rest.startsWith("/dev/")) {
+                for (UsbDevice d : um.getDeviceList().values()) {
+                    if (d.getVendorId() == VID_EPSON && serialEquals(rest, serialOf(d, appCtx))) {
+                        device = d;
+                        break;
+                    }
                 }
             }
         }
@@ -2111,12 +2470,16 @@ public class PluginWifiPrinter extends CordovaPlugin {
                     ? findUsbDeviceByDeviceName(um, pathFromEpson)
                     : findUsbDeviceByDeviceName(um, t);
             if (d == null && t.regionMatches(true, 0, "USB:", 0, 4)) {
-                for (UsbDevice x : um.getDeviceList().values()) {
-                    if (x.getVendorId() == VID_EPSON) {
-                        d = x;
-                        break;
+                String rest = t.length() > 4 ? t.substring(4).trim() : "";
+                if (!rest.isEmpty() && !rest.startsWith("/dev/")) {
+                    for (UsbDevice x : um.getDeviceList().values()) {
+                        if (x.getVendorId() == VID_EPSON && um.hasPermission(x)
+                                && serialEquals(rest, serialOf(x, ctx))) {
+                            return true;
+                        }
                     }
                 }
+                return false;
             }
         }
         return d != null && um.hasPermission(d);
@@ -2205,14 +2568,15 @@ public class PluginWifiPrinter extends CordovaPlugin {
         IDeviceConnection conn = null;
         try {
             Context ctx = cordova.getActivity().getApplicationContext();
-            UsbDevice liveDev = resolveUsbDevice(ctx, target, "xprinter");
+            UsbDevice liveDev = resolveUsbDeviceForPrint(ctx, target, "xprinter");
             String livePath = liveDev != null ? liveDev.getDeviceName() : null;
             if (livePath == null || livePath.trim().isEmpty()) {
                 Log.e(TAG, "Xprinter USB: cannot resolve live device for " + target);
                 cb.error("❌ ไม่พบเครื่องพิมพ์ USB — ตรวจสาย/ฮับ หรือกดสแกน USB แล้วเลือกเครื่องอีกครั้ง");
                 return;
             }
-            if (!hasUsbPermissionForTarget(ctx, target, "xprinter")) {
+            UsbManager umPrint = (UsbManager) ctx.getSystemService(Context.USB_SERVICE);
+            if (umPrint != null && !umPrint.hasPermission(liveDev)) {
                 Log.i(TAG, "Xprinter USB: requesting permission for live path " + livePath);
                 if (!ensureUsbPermissionBlocking(liveDev, 25000)) {
                     cb.error("❌ ยังไม่ได้รับสิทธิ์ USB — กด \"อนุญาต\" เมื่อระบบถาม "
@@ -2262,18 +2626,14 @@ public class PluginWifiPrinter extends CordovaPlugin {
         }
         boolean sentOk = false;
         try {
-            UsbDevice liveDev = resolveUsbDevice(appCtx, target, "epson");
-            if (liveDev != null && !hasUsbPermissionForTarget(appCtx, target, "epson")) {
-                if (!ensureUsbPermissionBlocking(liveDev, 25000)) {
-                    cb.error("ยังไม่ได้รับสิทธิ์ USB — กดอนุญาตเมื่อระบบถาม");
-                    return;
-                }
-            } else if (!hasUsbPermissionForTarget(appCtx, target, "epson")) {
-                cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
+            UsbDevice liveDev = resolveUsbDeviceForPrint(appCtx, target, "epson");
+            int series = epsonModelFromString(modelStr);
+            String tgt = epsonTargetFromIdentityOrDevice(appCtx, target, liveDev);
+            if ("USB:".equals(normalizeEpsonUsbConnectTarget(tgt))
+                    && usbAttachedDeviceCount(appCtx) > 1 && liveDev == null) {
+                cb.error("ต่อ USB หลายเครื่อง — ไม่พบเครื่อง Epson ที่บันทึกไว้ ให้สแกนแล้วเลือกเครื่องอีกครั้ง");
                 return;
             }
-            int series = epsonModelFromString(modelStr);
-            String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
 
             // ใช้ persistent printer (ไม่ disconnect ระหว่าง job — แก้ ERR_CONNECT ครั้งที่ 2+)
             Printer printer = getOrCreateEpsonUsbPrinter(series, appCtx, tgt);
@@ -2369,13 +2729,14 @@ public class PluginWifiPrinter extends CordovaPlugin {
             IDeviceConnection conn = null;
             try {
                 Context ctx = cordova.getActivity().getApplicationContext();
-                UsbDevice liveDev = resolveUsbDevice(ctx, target, "xprinter");
+                UsbDevice liveDev = resolveUsbDeviceForPrint(ctx, target, "xprinter");
                 String livePath = liveDev != null ? liveDev.getDeviceName() : null;
                 if (livePath == null || livePath.trim().isEmpty()) {
                     cb.error("ไม่พบเครื่องพิมพ์ USB — ตรวจสายหรือกดสแกนใหม่");
                     return;
                 }
-                if (!hasUsbPermissionForTarget(ctx, target, "xprinter")) {
+                UsbManager umDrawer = (UsbManager) ctx.getSystemService(Context.USB_SERVICE);
+                if (umDrawer != null && !umDrawer.hasPermission(liveDev)) {
                     if (!ensureUsbPermissionBlocking(liveDev, 25000)) {
                         cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
                         return;
@@ -2411,18 +2772,14 @@ public class PluginWifiPrinter extends CordovaPlugin {
         synchronized (EPSON_USB_GLOBAL_LOCK) {
             boolean ok = false;
             try {
-                UsbDevice liveDev = resolveUsbDevice(appCtx, target, "epson");
-                if (liveDev != null && !hasUsbPermissionForTarget(appCtx, target, "epson")) {
-                    if (!ensureUsbPermissionBlocking(liveDev, 25000)) {
-                        cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
-                        return;
-                    }
-                } else if (!hasUsbPermissionForTarget(appCtx, target, "epson")) {
-                    cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
+                UsbDevice liveDev = resolveUsbDeviceForPrint(appCtx, target, "epson");
+                int series = epsonModelFromString(modelStr);
+                String tgt = epsonTargetFromIdentityOrDevice(appCtx, target, liveDev);
+                if ("USB:".equals(normalizeEpsonUsbConnectTarget(tgt))
+                        && usbAttachedDeviceCount(appCtx) > 1 && liveDev == null) {
+                    cb.error("ต่อ USB หลายเครื่อง — ไม่พบเครื่อง Epson ที่บันทึกไว้ ให้สแกนแล้วเลือกเครื่องอีกครั้ง");
                     return;
                 }
-                int series = epsonModelFromString(modelStr);
-                String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
                 Printer printer = getOrCreateEpsonUsbPrinter(series, appCtx, tgt);
                 try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
                 try {
@@ -2483,18 +2840,14 @@ public class PluginWifiPrinter extends CordovaPlugin {
                 synchronized (EPSON_USB_GLOBAL_LOCK) {
                     boolean ok = false;
                     try {
-                        UsbDevice liveDev = resolveUsbDevice(appCtx, target, "epson");
-                        if (liveDev != null && !hasUsbPermissionForTarget(appCtx, target, "epson")) {
-                            if (!ensureUsbPermissionBlocking(liveDev, 25000)) {
-                                cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
-                                return;
-                            }
-                        } else if (!hasUsbPermissionForTarget(appCtx, target, "epson")) {
-                            cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง แล้วกดอนุญาต");
+                        UsbDevice liveDev = resolveUsbDeviceForPrint(appCtx, target, "epson");
+                        int series = epsonModelFromString(modelStr);
+                        String tgt = epsonTargetFromIdentityOrDevice(appCtx, target, liveDev);
+                        if ("USB:".equals(normalizeEpsonUsbConnectTarget(tgt))
+                                && usbAttachedDeviceCount(appCtx) > 1 && liveDev == null) {
+                            cb.error("ต่อ USB หลายเครื่อง — ไม่พบเครื่อง Epson ที่บันทึกไว้ ให้สแกนแล้วเลือกเครื่องอีกครั้ง");
                             return;
                         }
-                        int series = epsonModelFromString(modelStr);
-                        String tgt = (target == null || target.isEmpty()) ? "USB:" : target;
                         Printer printer = getOrCreateEpsonUsbPrinter(series, appCtx, tgt);
                         printer.clearCommandBuffer();
                         sleepQuiet(200);
@@ -2514,13 +2867,14 @@ public class PluginWifiPrinter extends CordovaPlugin {
                 IDeviceConnection conn = null;
                 try {
                     Context ctx = cordova.getActivity().getApplicationContext();
-                    UsbDevice liveDev = resolveUsbDevice(ctx, target, "xprinter");
+                    UsbDevice liveDev = resolveUsbDeviceForPrint(ctx, target, "xprinter");
                     String livePath = liveDev != null ? liveDev.getDeviceName() : null;
                     if (livePath == null || livePath.trim().isEmpty()) {
                         cb.error("ไม่พบเครื่องพิมพ์ USB — ตรวจสายหรือกดสแกนใหม่");
                         return;
                     }
-                    if (!hasUsbPermissionForTarget(ctx, target, "xprinter")) {
+                    UsbManager umClear = (UsbManager) ctx.getSystemService(Context.USB_SERVICE);
+                    if (umClear != null && !umClear.hasPermission(liveDev)) {
                         if (!ensureUsbPermissionBlocking(liveDev, 25000)) {
                             cb.error("ยังไม่ได้รับสิทธิ์ USB — กดเลือกเครื่องพิมพ์ในรายการอีกครั้ง");
                             return;
