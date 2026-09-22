@@ -99,7 +99,69 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
 @end
 #endif
 
+static NSMutableDictionary<NSString *, POSWIFIManager *> *DFWifiManagers;
+static NSMutableDictionary<NSString *, NSLock *> *DFWifiLocks;
+static NSLock *DFWifiGlobalLock;
+static BOOL DFWifiModeReady = NO;
+static BOOL DFWifiIsSingleton = NO;
+
 @implementation PluginWifiPrinter
+
+- (void)dfPrepareWifiMode {
+    if (DFWifiModeReady) {
+        return;
+    }
+    @synchronized ([PluginWifiPrinter class]) {
+        if (DFWifiModeReady) {
+            return;
+        }
+        if (!DFWifiLocks) {
+            DFWifiLocks = [NSMutableDictionary dictionary];
+        }
+        if (!DFWifiManagers) {
+            DFWifiManagers = [NSMutableDictionary dictionary];
+        }
+        if (!DFWifiGlobalLock) {
+            DFWifiGlobalLock = [NSLock new];
+        }
+        POSWIFIManager *first = [[POSWIFIManager alloc] init];
+        POSWIFIManager *second = [[POSWIFIManager alloc] init];
+        POSWIFIManager *shared = [POSWIFIManager sharedInstance];
+        DFWifiIsSingleton = (first == second) || (first == shared) || (second == shared);
+        DFWifiModeReady = YES;
+        NSLog(@"PluginWifiPrinter TCP mode: %@", DFWifiIsSingleton ? @"shared-singleton" : @"per-host");
+    }
+}
+
+- (NSLock *)dfWifiLockForKey:(NSString *)key {
+    [self dfPrepareWifiMode];
+    if (DFWifiIsSingleton) {
+        return DFWifiGlobalLock;
+    }
+    @synchronized ([PluginWifiPrinter class]) {
+        NSLock *lock = DFWifiLocks[key];
+        if (!lock) {
+            lock = [NSLock new];
+            DFWifiLocks[key] = lock;
+        }
+        return lock;
+    }
+}
+
+- (POSWIFIManager *)dfWifiManagerForKey:(NSString *)key {
+    [self dfPrepareWifiMode];
+    if (DFWifiIsSingleton) {
+        return [POSWIFIManager sharedInstance];
+    }
+    @synchronized ([PluginWifiPrinter class]) {
+        POSWIFIManager *manager = DFWifiManagers[key];
+        if (!manager) {
+            manager = [[POSWIFIManager alloc] init];
+            DFWifiManagers[key] = manager;
+        }
+        return manager;
+    }
+}
 
 #pragma mark - Public Methods
 
@@ -176,7 +238,11 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
     }
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        POSWIFIManager *wifi = [POSWIFIManager sharedInstance];
+        NSString *managerKey = [NSString stringWithFormat:@"%@:%u", host, (unsigned)port];
+        NSLock *wifiLock = [self dfWifiLockForKey:managerKey];
+        [wifiLock lock];
+        @try {
+        POSWIFIManager *wifi = [self dfWifiManagerForKey:managerKey];
         id<POSWIFIManagerDelegate> previousDelegate = wifi.delegate;
 
         NSData *imageData =
@@ -256,6 +322,9 @@ static int deltafoodEpsonSeriesFromString(NSString *modelStr) {
                 [self sendError:@"พิมพ์ผ่าน Xprinter SDK ล้มเหลว" command:command];
             }
         });
+        } @finally {
+            [wifiLock unlock];
+        }
     });
 }
 
