@@ -21,4 +21,9 @@
 - (void)openCashDrawerUsb:(CDVInvokedUrlCommand*)command;
 - (void)clearPrinterQueueUsb:(CDVInvokedUrlCommand*)command;
 
+// Bluetooth — Android: Xprinter Classic + Epson Classic/BLE. iOS: Xprinter BLE + Epson Classic/BLE.
+- (void)listBluetoothPrinters:(CDVInvokedUrlCommand*)command;
+- (void)printBase64ImageToBluetooth:(CDVInvokedUrlCommand*)command;
+- (void)openCashDrawerBluetooth:(CDVInvokedUrlCommand*)command;
+
 @end

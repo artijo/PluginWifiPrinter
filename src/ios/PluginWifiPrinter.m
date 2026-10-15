@@ -1,5 +1,6 @@
 #import "PluginWifiPrinter.h"
 #import "POSPrinterSDK.h"
+#import "POSPrinter.h"
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #include <sys/socket.h>
@@ -44,6 +45,154 @@
         self.didSignal = YES;
         dispatch_semaphore_signal(self.connectSem);
     }
+}
+
+@end
+
+static NSLock *DFBleLock;
+static NSMutableDictionary<NSString *, CBPeripheral *> *DFBlePeripherals;
+static NSMutableDictionary<NSString *, CBPeripheral *> *DFBleByMac;
+
+static NSString *DFNormalizeMac(NSString *raw) {
+    if (raw.length == 0) return @"";
+    NSString *s = [[raw uppercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([s hasPrefix:@"BLE:"]) s = [s substringFromIndex:4];
+    else if ([s hasPrefix:@"BT:"]) s = [s substringFromIndex:3];
+    s = [[s stringByReplacingOccurrencesOfString:@"-" withString:@":"] stringByReplacingOccurrencesOfString:@" " withString:@""];
+    if ([s rangeOfString:@":"].location == NSNotFound && s.length == 12) {
+        NSMutableString *out = [NSMutableString string];
+        for (NSUInteger i = 0; i < 12; i += 2) {
+            if (i > 0) [out appendString:@":"];
+            [out appendString:[s substringWithRange:NSMakeRange(i, 2)]];
+        }
+        s = out;
+    }
+    return s.length == 17 ? s : @"";
+}
+
+static void DFEnsureBleState(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        DFBleLock = [[NSLock alloc] init];
+        DFBlePeripherals = [NSMutableDictionary dictionary];
+        DFBleByMac = [NSMutableDictionary dictionary];
+    });
+}
+
+static void DFRunOnMain(void (^block)(void)) {
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), block);
+    }
+}
+
+static NSString *DFEpsonBluetoothTarget(NSString *target, NSString *transport) {
+    NSString *t = [target stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+    NSString *upper = [t uppercaseString];
+    if ([upper hasPrefix:@"BT:"] || [upper hasPrefix:@"BLE:"] || [upper hasPrefix:@"TCP:"] || [upper hasPrefix:@"USB:"]) {
+        return t;
+    }
+    if ([[transport lowercaseString] isEqualToString:@"ble"]) {
+        return [@"BLE:" stringByAppendingString:t];
+    }
+    return [@"BT:" stringByAppendingString:t];
+}
+
+@interface DeltafoodXprinterBleGate : NSObject <POSBLEManagerDelegate>
+@property (nonatomic, strong) NSMutableArray *found;
+@property (nonatomic, copy) NSString *waitUuid;
+@property (nonatomic, copy) NSString *waitMac;
+@property (nonatomic) dispatch_semaphore_t connectSem;
+@property (nonatomic) dispatch_semaphore_t scanSem;
+@property (nonatomic, assign) BOOL didConnect;
+@property (nonatomic, assign) BOOL connectFailed;
+@property (nonatomic, assign) BOOL scanSignaled;
+@end
+
+@implementation DeltafoodXprinterBleGate
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        _found = [NSMutableArray array];
+    }
+    return self;
+}
+
+- (void)rememberPeripheral:(CBPeripheral *)peripheral name:(NSString *)name uuid:(NSString *)uuid mac:(NSString *)mac {
+    if (peripheral == nil || uuid.length == 0) return;
+    NSString *key = [uuid uppercaseString];
+    NSString *macKey = DFNormalizeMac(mac);
+    @synchronized (DFBlePeripherals) {
+        DFBlePeripherals[key] = peripheral;
+        if (macKey.length) DFBleByMac[macKey] = peripheral;
+    }
+    NSDictionary *row = @{
+        @"brand": @"xprinter",
+        @"transport": @"ble",
+        @"target": uuid,
+        @"name": name.length ? name : @"Xprinter",
+        @"address": macKey.length ? macKey : uuid,
+        @"bonded": @NO,
+    };
+    BOOL replaced = NO;
+    for (NSUInteger i = 0; i < self.found.count; i++) {
+        NSString *existing = [self.found[i][@"target"] uppercaseString];
+        if ([existing isEqualToString:key]) {
+            self.found[i] = row;
+            replaced = YES;
+            break;
+        }
+    }
+    if (!replaced) {
+        [self.found addObject:row];
+    }
+    BOOL uuidHit = self.waitUuid.length && [key isEqualToString:[self.waitUuid uppercaseString]];
+    BOOL macHit = macKey.length && self.waitMac.length && [macKey isEqualToString:self.waitMac];
+    if ((uuidHit || macHit) && !self.scanSignaled && self.scanSem) {
+        self.scanSignaled = YES;
+        dispatch_semaphore_signal(self.scanSem);
+    }
+}
+
+- (void)POSbleUpdatePeripheralList:(NSArray *)peripherals RSSIList:(NSArray *)rssiList {
+    @synchronized (self) {
+        for (id item in peripherals) {
+            CBPeripheral *peripheral = nil;
+            NSString *name = nil;
+            NSString *uuid = nil;
+            NSString *mac = nil;
+            if ([item isKindOfClass:[CBPeripheral class]]) {
+                peripheral = item;
+                name = peripheral.name;
+                uuid = peripheral.identifier.UUIDString;
+            } else if ([item isKindOfClass:[POSPrinter class]]) {
+                POSPrinter *printer = item;
+                peripheral = printer.peripheral;
+                name = printer.name.length ? printer.name : peripheral.name;
+                uuid = printer.uuid.length ? printer.uuid : peripheral.identifier.UUIDString;
+                mac = printer.mac;
+            } else if ([item respondsToSelector:@selector(peripheral)]) {
+                peripheral = [item peripheral];
+                if ([item respondsToSelector:@selector(name)]) name = [item name];
+                if ([item respondsToSelector:@selector(uuid)]) uuid = [item uuid];
+                if ([item respondsToSelector:@selector(mac)]) mac = [item mac];
+                if (uuid.length == 0) uuid = peripheral.identifier.UUIDString;
+                if (name.length == 0) name = peripheral.name;
+            }
+            [self rememberPeripheral:peripheral name:name uuid:uuid mac:mac];
+        }
+    }
+}
+
+- (void)POSbleConnectPeripheral:(CBPeripheral *)peripheral {
+    self.didConnect = YES;
+    if (self.connectSem) dispatch_semaphore_signal(self.connectSem);
+}
+
+- (void)POSbleFailToConnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
+    self.connectFailed = YES;
+    if (self.connectSem) dispatch_semaphore_signal(self.connectSem);
 }
 
 @end
@@ -1058,5 +1207,411 @@ static BOOL DFWifiIsSingleton = NO;
     });
 #endif
 }
+
+#pragma mark - Bluetooth (Xprinter BLE / Epson Classic+BLE)
+
+- (void)listBluetoothPrinters:(CDVInvokedUrlCommand*)command {
+    DFEnsureBleState();
+    NSString *brandRaw = command.arguments.count > 0 ? [command.arguments objectAtIndex:0] : @"all";
+    NSString *brand = [[[brandRaw description] lowercaseString] copy];
+#if !DELTAFOOD_HAS_EPSON
+    if ([brand isEqualToString:@"epson"]) {
+        [self sendError:@"Epson SDK ไม่ได้ลิงก์กับ iOS build นี้" command:command];
+        return;
+    }
+#endif
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [DFBleLock lock];
+        NSMutableArray *printers = [NSMutableArray array];
+        @try {
+            if (![brand isEqualToString:@"epson"]) {
+                NSArray *xp = [self dfScanXprinterBleForSeconds:8 matchUuid:nil matchMac:nil];
+                if (xp.count) [printers addObjectsFromArray:xp];
+            }
+#if DELTAFOOD_HAS_EPSON
+            if (![brand isEqualToString:@"xprinter"]) {
+                [self dfAppendEpsonDiscoveryPort:EPOS2_PORTTYPE_BLUETOOTH transport:@"classic" into:printers seconds:5];
+                [self dfAppendEpsonDiscoveryPort:EPOS2_PORTTYPE_BLUETOOTH_LE transport:@"ble" into:printers seconds:6];
+            }
+#endif
+        } @catch (NSException *ex) {
+            [DFBleLock unlock];
+            [self sendError:[NSString stringWithFormat:@"สแกน Bluetooth ไม่สำเร็จ: %@", ex.reason ?: ex.name] command:command];
+            return;
+        }
+        [DFBleLock unlock];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CDVPluginResult *r = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                              messageAsDictionary:@{ @"printers": printers }];
+            [self.commandDelegate sendPluginResult:r callbackId:command.callbackId];
+        });
+    });
+}
+
+- (void)printBase64ImageToBluetooth:(CDVInvokedUrlCommand*)command {
+    DFEnsureBleState();
+    NSString *brand = command.arguments.count > 0 ? [command.arguments objectAtIndex:0] : @"xprinter";
+    NSString *target = command.arguments.count > 1 ? [command.arguments objectAtIndex:1] : @"";
+    NSString *base64 = command.arguments.count > 2 ? [command.arguments objectAtIndex:2] : @"";
+    CGFloat paperWidth = 576.f;
+    if (command.arguments.count > 3) {
+        NSObject *pw = [command.arguments objectAtIndex:3];
+        if ([pw respondsToSelector:@selector(floatValue)]) paperWidth = [(NSNumber *)pw floatValue];
+    }
+    NSString *model = command.arguments.count > 4 ? [[command.arguments objectAtIndex:4] description] : @"TM_T82";
+    NSString *transport = command.arguments.count > 5 ? [[command.arguments objectAtIndex:5] description] : @"";
+    NSString *address = command.arguments.count > 6 ? [[command.arguments objectAtIndex:6] description] : @"";
+    if (paperWidth <= 0) paperWidth = 576.f;
+    if (target.length == 0 || base64.length == 0) {
+        [self sendError:@"Bluetooth target หรือ Base64 ว่าง" command:command];
+        return;
+    }
+    NSString *brandLower = [[brand description] lowercaseString];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSData *imageData = [[NSData alloc] initWithBase64EncodedString:base64
+                                                                options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        UIImage *image = imageData ? [UIImage imageWithData:imageData] : nil;
+        if (image == nil) {
+            [self sendError:@"ไม่สามารถแปลง Base64 เป็นรูปภาพได้" command:command];
+            return;
+        }
+        UIImage *processed = [self resizeImage:image maxWidth:paperWidth];
+        UIImage *bwImage = [self convertToBlackAndWhite:processed];
+        [DFBleLock lock];
+        NSString *failure = nil;
+        BOOL ok = NO;
+        @try {
+            if ([brandLower isEqualToString:@"epson"]) {
+                ok = [self dfEpsonBluetoothPrintImage:processed target:target model:model transport:transport error:&failure];
+            } else {
+                ok = [self dfXprinterBleSendImage:bwImage uuid:target mac:address error:&failure];
+            }
+        } @catch (NSException *ex) {
+            failure = ex.reason ?: @"พิมพ์ Bluetooth ไม่สำเร็จ";
+            ok = NO;
+        }
+        [DFBleLock unlock];
+        if (ok) {
+            [self sendSuccess:@"1" command:command];
+        } else {
+            [self sendError:failure ?: @"พิมพ์ Bluetooth ไม่สำเร็จ" command:command];
+        }
+    });
+}
+
+- (void)openCashDrawerBluetooth:(CDVInvokedUrlCommand*)command {
+    DFEnsureBleState();
+    NSString *brand = command.arguments.count > 0 ? [command.arguments objectAtIndex:0] : @"xprinter";
+    NSString *target = command.arguments.count > 1 ? [command.arguments objectAtIndex:1] : @"";
+    NSString *model = command.arguments.count > 2 ? [[command.arguments objectAtIndex:2] description] : @"TM_T82";
+    NSString *transport = command.arguments.count > 3 ? [[command.arguments objectAtIndex:3] description] : @"";
+    if (target.length == 0) {
+        [self sendError:@"ไม่มีที่อยู่ Bluetooth" command:command];
+        return;
+    }
+    NSString *brandLower = [[brand description] lowercaseString];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [DFBleLock lock];
+        NSString *failure = nil;
+        BOOL ok = NO;
+        @try {
+            if ([brandLower isEqualToString:@"epson"]) {
+                ok = [self dfEpsonBluetoothOpenDrawerTarget:target model:model transport:transport error:&failure];
+            } else {
+                const uint8_t cmd[] = {0x1B, 0x70, 0x00, 0x19, 0xFA, 0x1B, 0x70, 0x01, 0x19, 0xFA};
+                NSData *data = [NSData dataWithBytes:cmd length:sizeof(cmd)];
+                ok = [self dfXprinterBleWriteData:data uuid:target mac:nil error:&failure];
+            }
+        } @catch (NSException *ex) {
+            failure = ex.reason ?: @"เปิดลิ้นชักไม่สำเร็จ";
+            ok = NO;
+        }
+        [DFBleLock unlock];
+        if (ok) {
+            [self sendSuccess:@"เปิดลิ้นชักเก็บเงินสำเร็จ" command:command];
+        } else {
+            [self sendError:failure ?: @"เปิดลิ้นชักไม่สำเร็จ" command:command];
+        }
+    });
+}
+
+- (NSArray *)dfScanXprinterBleForSeconds:(NSTimeInterval)seconds matchUuid:(NSString *)uuid matchMac:(NSString *)mac {
+    DFEnsureBleState();
+    POSBLEManager *ble = [POSBLEManager sharedInstance];
+    DeltafoodXprinterBleGate *gate = [DeltafoodXprinterBleGate new];
+    gate.waitUuid = uuid;
+    gate.waitMac = DFNormalizeMac(mac);
+    gate.scanSem = dispatch_semaphore_create(0);
+    DFRunOnMain(^{
+        ble.delegate = gate;
+        [ble stopScan];
+        [ble startScan];
+    });
+    dispatch_semaphore_wait(gate.scanSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)));
+    DFRunOnMain(^{
+        [ble stopScan];
+        if (ble.delegate == gate) ble.delegate = nil;
+    });
+    @synchronized (gate) {
+        return [gate.found copy];
+    }
+}
+
+- (CBPeripheral *)dfXprinterPeripheralForUuid:(NSString *)uuid mac:(NSString *)mac {
+    return [self dfXprinterPeripheralForUuid:uuid mac:mac scanSeconds:12];
+}
+
+- (CBPeripheral *)dfXprinterPeripheralForUuid:(NSString *)uuid mac:(NSString *)mac scanSeconds:(NSTimeInterval)seconds {
+    NSString *key = [uuid uppercaseString];
+    NSString *macKey = DFNormalizeMac(mac);
+    @synchronized (DFBlePeripherals) {
+        CBPeripheral *cached = key.length ? DFBlePeripherals[key] : nil;
+        if (!cached && macKey.length) cached = DFBleByMac[macKey];
+        if (cached) return cached;
+    }
+    [self dfScanXprinterBleForSeconds:seconds matchUuid:uuid matchMac:macKey];
+    @synchronized (DFBlePeripherals) {
+        CBPeripheral *found = key.length ? DFBlePeripherals[key] : nil;
+        if (!found && macKey.length) found = DFBleByMac[macKey];
+        return found;
+    }
+}
+
+- (BOOL)dfXprinterBleWriteData:(NSData *)data uuid:(NSString *)uuid mac:(NSString *)mac error:(NSString **)error {
+    CBPeripheral *peripheral = [self dfXprinterPeripheralForUuid:uuid mac:mac];
+    if (peripheral == nil) {
+        if (error) *error = @"BT_OFFLINE: ไม่พบเครื่องพิมพ์ Xprinter — เปิดเครื่องให้อยู่ใกล้แล้วลองใหม่";
+        return NO;
+    }
+    POSBLEManager *ble = [POSBLEManager sharedInstance];
+    DeltafoodXprinterBleGate *gate = [DeltafoodXprinterBleGate new];
+    gate.connectSem = dispatch_semaphore_create(0);
+    DFRunOnMain(^{
+        ble.delegate = gate;
+        [ble stopScan];
+        [ble connectDevice:peripheral];
+    });
+    dispatch_semaphore_wait(gate.connectSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)));
+    NSDate *readyUntil = [NSDate dateWithTimeIntervalSinceNow:3];
+    while (![ble printerIsConnect] && [readyUntil timeIntervalSinceNow] > 0 && !gate.connectFailed) {
+        [NSThread sleepForTimeInterval:0.1];
+    }
+    if (gate.connectFailed || (![ble printerIsConnect] && !gate.didConnect)) {
+        DFRunOnMain(^{
+            [ble disconnectRootPeripheral];
+            if (ble.delegate == gate) ble.delegate = nil;
+        });
+        if (error) *error = @"BT_OFFLINE: เชื่อมต่อ Xprinter ผ่าน Bluetooth LE ไม่สำเร็จ";
+        return NO;
+    }
+
+    dispatch_semaphore_t writeSem = dispatch_semaphore_create(0);
+    __block BOOL writeOk = NO;
+    __block BOOL signaled = NO;
+    DFRunOnMain(^{
+        [ble writeCommandWithData:data writeCallBack:^(CBCharacteristic *characteristic, NSError *writeError) {
+            if (signaled) return;
+            signaled = YES;
+            writeOk = (writeError == nil);
+            dispatch_semaphore_signal(writeSem);
+        }];
+    });
+    long waitResult = dispatch_semaphore_wait(writeSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_SEC)));
+    NSTimeInterval extra = MIN(8.0, MAX(0.4, data.length / 6000.0));
+    [NSThread sleepForTimeInterval:extra];
+    DFRunOnMain(^{
+        [ble disconnectRootPeripheral];
+        if (ble.delegate == gate) ble.delegate = nil;
+    });
+    if (waitResult != 0 || !writeOk) {
+        if (error) *error = @"BT_OFFLINE: ส่งข้อมูลไปเครื่องพิมพ์ Xprinter ไม่สำเร็จ";
+        return NO;
+    }
+    return YES;
+}
+
+- (BOOL)dfXprinterBleSendImage:(UIImage *)image uuid:(NSString *)uuid mac:(NSString *)mac error:(NSString **)error {
+    NSMutableData *dataM = [NSMutableData dataWithData:[POSCommand initializePrinter]];
+    [dataM appendData:[POSCommand selectAlignment:POS_ALIGNMENT_CENTER]];
+    [dataM appendData:[POSCommand printRasteBmpWithM:RasterNolmorWH andImage:image andType:Dithering]];
+    [dataM appendData:[POSCommand printAndFeedForwardWhitN:6]];
+    [dataM appendData:[POSCommand selectCutPageModelAndCutpage:1]];
+    return [self dfXprinterBleWriteData:dataM uuid:uuid mac:mac error:error];
+}
+
+- (BOOL)dfEpsonBluetoothPrintImage:(UIImage *)image
+                            target:(NSString *)target
+                             model:(NSString *)model
+                         transport:(NSString *)transport
+                             error:(NSString **)error {
+#if !DELTAFOOD_HAS_EPSON
+    if (error) *error = @"Epson SDK ไม่ได้ลิงก์กับ iOS build นี้";
+    return NO;
+#else
+    int series = deltafoodEpsonSeriesFromString(model);
+    Epos2Printer *printer = [[Epos2Printer alloc] initWithPrinterSeries:series lang:EPOS2_MODEL_ANK];
+    if (printer == nil) {
+        if (error) *error = @"ไม่สามารถสร้าง Epson printer ได้";
+        return NO;
+    }
+    NSString *tgt = DFEpsonBluetoothTarget(target, transport);
+    int code = [printer connect:tgt timeout:20000];
+    if (code != EPOS2_SUCCESS) {
+        if (error) *error = [NSString stringWithFormat:@"BT_OFFLINE: Epson Bluetooth connect failed (code=%d)", code];
+        return NO;
+    }
+    BOOL ok = NO;
+    @try {
+        [printer beginTransaction];
+        [printer addTextAlign:EPOS2_ALIGN_CENTER];
+        [printer addImage:image
+                        x:0 y:0
+                    width:(long)image.size.width
+                   height:(long)image.size.height
+                    color:EPOS2_COLOR_1
+                     mode:EPOS2_MODE_MONO
+                 halftone:EPOS2_HALFTONE_DITHER
+               brightness:EPOS2_PARAM_DEFAULT
+                 compress:EPOS2_PARAM_DEFAULT];
+        [printer addFeedLine:3];
+        [printer addCut:EPOS2_CUT_FEED];
+        ok = ([printer sendData:EPOS2_PARAM_DEFAULT] == EPOS2_SUCCESS);
+        [printer endTransaction];
+    } @catch (NSException *ex) {
+        NSLog(@"Epson Bluetooth print exception: %@", ex);
+        ok = NO;
+    }
+    [printer disconnect];
+    [printer clearCommandBuffer];
+    if (!ok && error && *error == nil) *error = @"พิมพ์ผ่าน Epson Bluetooth ไม่สำเร็จ";
+    return ok;
+#endif
+}
+
+- (BOOL)dfEpsonBluetoothOpenDrawerTarget:(NSString *)target
+                                   model:(NSString *)model
+                               transport:(NSString *)transport
+                                   error:(NSString **)error {
+#if !DELTAFOOD_HAS_EPSON
+    if (error) *error = @"Epson SDK ไม่ได้ลิงก์กับ iOS build นี้";
+    return NO;
+#else
+    int series = deltafoodEpsonSeriesFromString(model);
+    Epos2Printer *printer = [[Epos2Printer alloc] initWithPrinterSeries:series lang:EPOS2_MODEL_ANK];
+    if (printer == nil) {
+        if (error) *error = @"ไม่สามารถสร้าง Epson printer ได้";
+        return NO;
+    }
+    NSString *tgt = DFEpsonBluetoothTarget(target, transport);
+    int code = [printer connect:tgt timeout:20000];
+    if (code != EPOS2_SUCCESS) {
+        if (error) *error = [NSString stringWithFormat:@"Epson Bluetooth connect failed (code=%d)", code];
+        return NO;
+    }
+    BOOL ok = NO;
+    @try {
+        [printer beginTransaction];
+        [printer addPulse:EPOS2_DRAWER_2PIN time:EPOS2_PULSE_100];
+        [printer addPulse:EPOS2_DRAWER_5PIN time:EPOS2_PULSE_100];
+        ok = ([printer sendData:EPOS2_PARAM_DEFAULT] == EPOS2_SUCCESS);
+        [printer endTransaction];
+    } @catch (NSException *ex) {
+        ok = NO;
+    }
+    [printer disconnect];
+    [printer clearCommandBuffer];
+    if (!ok && error) *error = @"เปิดลิ้นชักผ่าน Epson Bluetooth ไม่สำเร็จ";
+    return ok;
+#endif
+}
+
+- (void)probeBluetoothPrinter:(CDVInvokedUrlCommand*)command {
+    DFEnsureBleState();
+    NSString *brand = command.arguments.count > 0 ? [[command.arguments objectAtIndex:0] description] : @"xprinter";
+    NSString *target = command.arguments.count > 1 ? [[command.arguments objectAtIndex:1] description] : @"";
+    NSString *model = command.arguments.count > 2 ? [[command.arguments objectAtIndex:2] description] : @"";
+    NSString *transport = command.arguments.count > 3 ? [[command.arguments objectAtIndex:3] description] : @"";
+    NSString *address = command.arguments.count > 4 ? [[command.arguments objectAtIndex:4] description] : @"";
+    if (target.length == 0) {
+        [self sendError:@"BT_OFFLINE: ไม่มีที่อยู่ Bluetooth" command:command];
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [DFBleLock lock];
+        BOOL online = NO;
+        @try {
+            if ([[brand lowercaseString] isEqualToString:@"epson"]) {
+                online = [self dfEpsonBluetoothProbeTarget:target model:model transport:transport];
+            } else {
+                online = [self dfXprinterPeripheralForUuid:target mac:address scanSeconds:4] != nil;
+            }
+        } @catch (NSException *ex) {
+            online = NO;
+        }
+        [DFBleLock unlock];
+        if (online) {
+            [self sendSuccess:@"1" command:command];
+        } else {
+            [self sendError:@"BT_OFFLINE: เครื่องพิมพ์ยังไม่พร้อม" command:command];
+        }
+    });
+}
+
+- (BOOL)dfEpsonBluetoothProbeTarget:(NSString *)target model:(NSString *)model transport:(NSString *)transport {
+#if !DELTAFOOD_HAS_EPSON
+    return NO;
+#else
+    int series = deltafoodEpsonSeriesFromString(model);
+    Epos2Printer *printer = [[Epos2Printer alloc] initWithPrinterSeries:series lang:EPOS2_MODEL_ANK];
+    if (printer == nil) return NO;
+    NSString *tgt = DFEpsonBluetoothTarget(target, transport);
+    int code = [printer connect:tgt timeout:4000];
+    if (code == EPOS2_SUCCESS) {
+        [printer disconnect];
+        [printer clearCommandBuffer];
+        return YES;
+    }
+    return NO;
+#endif
+}
+
+#if DELTAFOOD_HAS_EPSON
+- (void)dfAppendEpsonDiscoveryPort:(int)portType
+                         transport:(NSString *)transport
+                              into:(NSMutableArray *)printers
+                           seconds:(NSTimeInterval)seconds {
+    DeltafoodEpsonDiscoveryDelegate *delegate = [DeltafoodEpsonDiscoveryDelegate new];
+    Epos2FilterOption *opt = [[Epos2FilterOption alloc] init];
+    [opt setPortType:portType];
+    [opt setDeviceType:EPOS2_TYPE_PRINTER];
+    int code = [Epos2Discovery start:opt delegate:delegate];
+    if (code != EPOS2_SUCCESS) {
+        [Epos2Discovery stop];
+        code = [Epos2Discovery start:opt delegate:delegate];
+    }
+    if (code != EPOS2_SUCCESS) {
+        NSLog(@"Epson Bluetooth discovery start failed (%@) code=%d", transport, code);
+        return;
+    }
+    [NSThread sleepForTimeInterval:seconds];
+    [Epos2Discovery stop];
+    @synchronized (delegate.devices) {
+        for (Epos2DeviceInfo *info in delegate.devices) {
+            NSString *target = [info getTarget] ?: @"";
+            if (target.length == 0) continue;
+            NSString *name = [info getDeviceName];
+            if (name.length == 0) name = @"Epson";
+            [printers addObject:@{
+                @"brand": @"epson",
+                @"transport": transport ?: @"",
+                @"target": target,
+                @"name": name,
+                @"address": [info getMacAddress] ?: @"",
+                @"bonded": @NO,
+            }];
+        }
+    }
+}
+#endif
 
 @end

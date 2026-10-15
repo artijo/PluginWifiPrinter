@@ -280,3 +280,123 @@ exports.watchUsbAttach = function (success, error) {
   exec(success, error, 'PluginWifiPrinter', 'watchUsbAttach', []);
 };
 
+//============================================================
+//============= Bluetooth (Xprinter / Epson) =================
+//============================================================
+// Android: Xprinter = Bluetooth Classic (SPP, MAC). Epson = Classic + BLE (ePOS2).
+// iOS: Xprinter = BLE (POSBLEManager). Epson = Classic (MFi) + BLE (ePOS2).
+
+/**
+ * @param {string} brand "xprinter"|"epson"|"all"
+ * success([{brand, transport, target, name, address, bonded}])
+ * transport: "classic" | "ble"
+ * target: MAC (Android Xprinter) | "BT:"/"BLE:" (Epson) | peripheral UUID (iOS Xprinter)
+ */
+exports.listBluetoothPrinters = function (brand, success, error) {
+  if (typeof brand === 'function') {
+    error = success;
+    success = brand;
+    brand = 'all';
+  }
+  exec(
+    function (res) {
+      var parsed = res;
+      if (typeof res === 'string') {
+        try { parsed = JSON.parse(res); }
+        catch (e) { parsed = { printers: [] }; }
+      }
+      success && success(parsed && parsed.printers ? parsed.printers : []);
+    },
+    function (err) { error && error(err); },
+    'PluginWifiPrinter',
+    'listBluetoothPrinters',
+    [brand || 'all']
+  );
+};
+
+/**
+ * พิมพ์ภาพ Base64 ผ่าน Bluetooth
+ * @param {string} transport "classic"|"ble"|"" 
+ */
+exports.printBase64ImageToBluetooth = function (brand, target, base64Data, paperWidth, model, transport, address, success, error) {
+  if (typeof paperWidth === 'function') {
+    error = model;
+    success = paperWidth;
+    paperWidth = 576;
+    model = '';
+    transport = '';
+    address = '';
+  } else if (typeof model === 'function') {
+    error = success;
+    success = model;
+    model = '';
+    transport = '';
+    address = '';
+  } else if (typeof transport === 'function') {
+    error = success;
+    success = transport;
+    transport = '';
+    address = '';
+  } else if (typeof address === 'function') {
+    error = success;
+    success = address;
+    address = '';
+  }
+  var w = paperWidth != null && paperWidth !== '' ? Number(paperWidth) : 576;
+  if (!isFinite(w) || w <= 0) w = 576;
+  exec(
+    success,
+    error,
+    'PluginWifiPrinter',
+    'printBase64ImageToBluetooth',
+    [brand || 'xprinter', target, base64Data, w, model || '', transport || '', address || '']
+  );
+};
+
+/** เช็คว่าเครื่องที่บันทึกไว้เปิดและรับการเชื่อมต่ออยู่ โดยไม่พิมพ์ */
+exports.probeBluetoothPrinter = function (brand, target, model, transport, address, success, error) {
+  if (typeof model === 'function') {
+    error = success;
+    success = model;
+    model = '';
+    transport = '';
+    address = '';
+  } else if (typeof transport === 'function') {
+    error = success;
+    success = transport;
+    transport = '';
+    address = '';
+  } else if (typeof address === 'function') {
+    error = success;
+    success = address;
+    address = '';
+  }
+  exec(
+    success,
+    error,
+    'PluginWifiPrinter',
+    'probeBluetoothPrinter',
+    [brand || 'xprinter', target, model || '', transport || '', address || '']
+  );
+};
+
+exports.openCashDrawerBluetooth = function (brand, target, model, transport, success, error) {
+  if (typeof model === 'function') {
+    error = success;
+    success = model;
+    model = '';
+    transport = '';
+  } else if (typeof transport === 'function') {
+    error = success;
+    success = transport;
+    transport = '';
+  }
+  exec(
+    success,
+    error,
+    'PluginWifiPrinter',
+    'openCashDrawerBluetooth',
+    [brand || 'xprinter', target, model || '', transport || '']
+  );
+};
+

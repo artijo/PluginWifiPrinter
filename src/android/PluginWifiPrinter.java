@@ -1,11 +1,17 @@
 package com.yourcompany.pluginwifiprinter;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.PendingIntent;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothClass;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.graphics.*;
 import android.hardware.usb.UsbConstants;
 import android.hardware.usb.UsbDevice;
@@ -91,6 +97,11 @@ public class PluginWifiPrinter extends CordovaPlugin {
     private CallbackContext usbWatchCb;
     private BroadcastReceiver usbAttachReceiver;
     private final Set<String> lastUsbDeviceNames = new HashSet<>();
+
+    private static final int REQ_BT_PERMISSION = 0xB701;
+    private static final Object BT_PERMISSION_LOCK = new Object();
+    private CountDownLatch btPermissionLatch;
+    private volatile boolean btPermissionGranted;
 
     private static final IConnectListener EMPTY_POS_LISTENER =
             (code, connInfo, msg) ->
@@ -260,10 +271,60 @@ public class PluginWifiPrinter extends CordovaPlugin {
         } else if ("watchUsbAttach".equals(action)) {
             watchUsbAttach(callbackContext);
             return true;
+        } else if ("listBluetoothPrinters".equals(action)) {
+            String brand = args.optString(0, "all");
+            listBluetoothPrinters(brand, callbackContext);
+            return true;
+        } else if ("printBase64ImageToBluetooth".equals(action)) {
+            String brand = args.getString(0);
+            String target = args.getString(1);
+            String base64Data = args.getString(2);
+            int paperWidth = args.optInt(3, 576);
+            String modelStr = args.optString(4, "");
+            String transport = args.optString(5, "");
+            printBase64ImageToBluetooth(brand, target, base64Data, paperWidth, modelStr, transport, callbackContext);
+            return true;
+        } else if ("openCashDrawerBluetooth".equals(action)) {
+            String brand = args.getString(0);
+            String target = args.getString(1);
+            String modelStr = args.optString(2, "");
+            String transport = args.optString(3, "");
+            openCashDrawerBluetooth(brand, target, modelStr, transport, callbackContext);
+            return true;
+        } else if ("probeBluetoothPrinter".equals(action)) {
+            String brand = args.optString(0, "xprinter");
+            String target = args.optString(1, "");
+            String modelStr = args.optString(2, "");
+            String transport = args.optString(3, "");
+            probeBluetoothPrinter(brand, target, modelStr, transport, callbackContext);
+            return true;
         }
 
         Log.w(TAG, "Unknown action: " + action);
         return false;
+    }
+
+    @Override
+    public void onRequestPermissionResult(int requestCode, String[] permissions, int[] grantResults)
+            throws JSONException {
+        if (requestCode != REQ_BT_PERMISSION) {
+            return;
+        }
+        boolean ok = grantResults != null && grantResults.length > 0;
+        if (ok) {
+            for (int grant : grantResults) {
+                if (grant != PackageManager.PERMISSION_GRANTED) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        synchronized (BT_PERMISSION_LOCK) {
+            btPermissionGranted = ok;
+            if (btPermissionLatch != null) {
+                btPermissionLatch.countDown();
+            }
+        }
     }
 
     private void listAttachedUsbDevices(CallbackContext cb) {
@@ -2945,5 +3006,643 @@ public class PluginWifiPrinter extends CordovaPlugin {
             default:
                 return Printer.TM_T82;
         }
+    }
+
+    // ===================== Bluetooth (Xprinter Classic / Epson Classic+BLE) =====================
+
+    private void listBluetoothPrinters(String brand, CallbackContext cb) {
+        cordova.getThreadPool().execute(() -> {
+            try {
+                if (!ensureBluetoothPermissionBlocking()) {
+                    cb.error("ไม่ได้รับสิทธิ์ Bluetooth — เปิดสิทธิ์ Nearby devices / Bluetooth ในการตั้งค่าแอป");
+                    return;
+                }
+                Context ctx = cordova.getActivity() != null
+                        ? cordova.getActivity().getApplicationContext()
+                        : cordova.getContext();
+                if (ctx == null) {
+                    cb.error("ไม่พบ context");
+                    return;
+                }
+                BluetoothAdapter adapter = bluetoothAdapter(ctx);
+                if (adapter == null) {
+                    cb.error("เครื่องนี้ไม่มี Bluetooth");
+                    return;
+                }
+                if (!adapter.isEnabled()) {
+                    cb.error("Bluetooth ปิดอยู่ — เปิด Bluetooth ก่อนสแกน");
+                    return;
+                }
+                String b = brand == null ? "all" : brand.toLowerCase(Locale.ROOT);
+                JSONArray printers = new JSONArray();
+                if (!"epson".equals(b)) {
+                    appendXprinterBluetoothDevices(ctx, printers);
+                }
+                if (!"xprinter".equals(b)) {
+                    appendEpsonBluetoothDevices(ctx, printers);
+                }
+                JSONObject result = new JSONObject();
+                result.put("printers", printers);
+                cb.success(result);
+            } catch (Exception e) {
+                Log.e(TAG, "listBluetoothPrinters error: " + e.getMessage(), e);
+                cb.error("สแกน Bluetooth ไม่สำเร็จ: " + e.getMessage());
+            }
+        });
+    }
+
+    private void printBase64ImageToBluetooth(
+            String brand, String target, String base64Image, int paperWidth,
+            String modelStr, String transport, CallbackContext cb) {
+        if (base64Image == null || base64Image.trim().isEmpty()) {
+            cb.error("ข้อมูล Base64 ว่างเปล่า");
+            return;
+        }
+        if (target == null || target.trim().isEmpty()) {
+            cb.error("ไม่มีที่อยู่ Bluetooth");
+            return;
+        }
+        if (paperWidth <= 0) paperWidth = 576;
+        final int widthPx = paperWidth;
+        final String b = brand == null ? "" : brand.toLowerCase(Locale.ROOT);
+        final String lockKey = "bt:" + target;
+        cordova.getThreadPool().execute(() -> {
+            synchronized (printerLocks.computeIfAbsent(lockKey, k -> new Object())) {
+                if (!ensureBluetoothPermissionBlocking()) {
+                    cb.error("ไม่ได้รับสิทธิ์ Bluetooth");
+                    return;
+                }
+                Bitmap originalBitmap = null;
+                Bitmap processedBitmap = null;
+                try {
+                    byte[] decoded = Base64.decode(base64Image.replaceAll("\\s", ""), Base64.NO_WRAP);
+                    originalBitmap = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
+                    if (originalBitmap == null) {
+                        cb.error("ไม่สามารถแปลง Base64 เป็นรูปภาพได้");
+                        return;
+                    }
+                    processedBitmap = resizeBitmap(originalBitmap, widthPx);
+                    processedBitmap = toBlackAndWhiteDither(processedBitmap);
+                    if ("epson".equals(b)) {
+                        printBitmapEpsonBluetooth(target, processedBitmap, widthPx, modelStr, transport, cb);
+                    } else {
+                        printBitmapXprinterBluetooth(target, processedBitmap, widthPx, cb);
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Bluetooth print error: " + e.getMessage(), e);
+                    cb.error("พิมพ์ Bluetooth ไม่สำเร็จ: " + e.getMessage());
+                } finally {
+                    if (processedBitmap != null && !processedBitmap.isRecycled()) {
+                        try { processedBitmap.recycle(); } catch (Exception ignored) {}
+                    }
+                    if (originalBitmap != null && !originalBitmap.isRecycled()) {
+                        try { originalBitmap.recycle(); } catch (Exception ignored) {}
+                    }
+                }
+            }
+        });
+    }
+
+    private void openCashDrawerBluetooth(
+            String brand, String target, String modelStr, String transport, CallbackContext cb) {
+        if (target == null || target.trim().isEmpty()) {
+            cb.error("ไม่มีที่อยู่ Bluetooth");
+            return;
+        }
+        final String b = brand == null ? "" : brand.toLowerCase(Locale.ROOT);
+        final String lockKey = "bt:" + target;
+        cordova.getThreadPool().execute(() -> {
+            synchronized (printerLocks.computeIfAbsent(lockKey, k -> new Object())) {
+                if (!ensureBluetoothPermissionBlocking()) {
+                    cb.error("ไม่ได้รับสิทธิ์ Bluetooth");
+                    return;
+                }
+                if ("epson".equals(b)) {
+                    openCashDrawerEpsonBluetooth(target, modelStr, transport, cb);
+                } else {
+                    openCashDrawerXprinterBluetooth(target, cb);
+                }
+            }
+        });
+    }
+
+    private boolean ensureBluetoothPermissionBlocking() {
+        if (bluetoothPermissionGranted()) return true;
+        Activity activity = cordova.getActivity();
+        if (activity == null || activity.isFinishing()) return false;
+        final CountDownLatch latch = new CountDownLatch(1);
+        synchronized (BT_PERMISSION_LOCK) {
+            btPermissionLatch = latch;
+            btPermissionGranted = false;
+        }
+        final String[] perms = Build.VERSION.SDK_INT >= 31
+                ? new String[]{Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT}
+                : new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+        activity.runOnUiThread(() -> cordova.requestPermissions(PluginWifiPrinter.this, REQ_BT_PERMISSION, perms));
+        try {
+            latch.await(30, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return bluetoothPermissionGranted();
+    }
+
+    private boolean bluetoothPermissionGranted() {
+        Activity activity = cordova.getActivity();
+        if (activity == null) return false;
+        if (Build.VERSION.SDK_INT >= 31) {
+            return activity.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+                    && activity.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED;
+        }
+        if (Build.VERSION.SDK_INT >= 23) {
+            return activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        }
+        return true;
+    }
+
+    private BluetoothAdapter bluetoothAdapter(Context ctx) {
+        BluetoothManager bm = (BluetoothManager) ctx.getSystemService(Context.BLUETOOTH_SERVICE);
+        if (bm != null && bm.getAdapter() != null) return bm.getAdapter();
+        return BluetoothAdapter.getDefaultAdapter();
+    }
+
+    private void registerBtReceiver(Context ctx, BroadcastReceiver receiver, IntentFilter filter) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            ctx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            ctx.registerReceiver(receiver, filter);
+        }
+    }
+
+    private static String normalizeMac(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim().toUpperCase(Locale.ROOT);
+        if (s.startsWith("BLE:")) s = s.substring(4);
+        else if (s.startsWith("BT:")) s = s.substring(3);
+        s = s.replace('-', ':').replace(" ", "");
+        if (s.indexOf(':') < 0 && s.length() == 12) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 12; i += 2) {
+                if (i > 0) sb.append(':');
+                sb.append(s, i, i + 2);
+            }
+            s = sb.toString();
+        }
+        return s;
+    }
+
+    private static String safeBtName(BluetoothDevice device) {
+        try {
+            String name = device.getName();
+            if (name != null && !name.trim().isEmpty()) return name.trim();
+        } catch (SecurityException ignored) {}
+        return device.getAddress() != null ? device.getAddress() : "Bluetooth";
+    }
+
+    private static boolean looksLikePrinter(BluetoothDevice device, String name) {
+        String n = name == null ? "" : name.toLowerCase(Locale.ROOT);
+        if (n.contains("print") || n.contains("xprinter") || n.contains("xp-") || n.contains("epson")
+                || n.contains("thermal") || n.contains("pos-") || n.contains("tm-") || n.contains("tm_")
+                || n.contains("gprinter") || n.contains("rongta") || n.contains("zjiang") || n.contains("innerprinter")) {
+            return true;
+        }
+        try {
+            BluetoothClass cls = device.getBluetoothClass();
+            if (cls != null && cls.getMajorDeviceClass() == BluetoothClass.Device.Major.IMAGING) {
+                return true;
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private void putBtDevice(JSONArray out, Set<String> seen, String brand, String transport,
+                             String target, String name, String address, boolean bonded) throws JSONException {
+        if (target == null || target.trim().isEmpty()) return;
+        String key = (brand + "|" + target).toUpperCase(Locale.ROOT);
+        if (!seen.add(key)) return;
+        JSONObject o = new JSONObject();
+        o.put("brand", brand);
+        o.put("transport", transport);
+        o.put("target", target);
+        o.put("name", name == null || name.isEmpty() ? target : name);
+        o.put("address", address == null ? "" : address);
+        o.put("bonded", bonded);
+        out.put(o);
+    }
+
+    private void appendXprinterBluetoothDevices(Context ctx, JSONArray out) throws Exception {
+        BluetoothAdapter adapter = bluetoothAdapter(ctx);
+        if (adapter == null) {
+            throw new Exception("เครื่องนี้ไม่มี Bluetooth");
+        }
+        if (!adapter.isEnabled()) {
+            throw new Exception("Bluetooth ปิดอยู่ — เปิด Bluetooth ก่อนสแกน");
+        }
+        Set<String> seen = new HashSet<>();
+        JSONArray printerLike = new JSONArray();
+        JSONArray others = new JSONArray();
+        Map<String, BluetoothDevice> found = new LinkedHashMap<>();
+        try {
+            Set<BluetoothDevice> bonded = adapter.getBondedDevices();
+            if (bonded != null) {
+                for (BluetoothDevice d : bonded) {
+                    if (d != null && d.getAddress() != null) found.put(d.getAddress().toUpperCase(Locale.ROOT), d);
+                }
+            }
+        } catch (SecurityException se) {
+            throw new Exception("ไม่ได้รับสิทธิ์อ่านอุปกรณ์ Bluetooth");
+        }
+
+        final CountDownLatch done = new CountDownLatch(1);
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent intent) {
+                String action = intent.getAction();
+                if (BluetoothDevice.ACTION_FOUND.equals(action)) {
+                    BluetoothDevice d = bluetoothDeviceExtra(intent);
+                    if (d != null && d.getAddress() != null) {
+                        found.put(d.getAddress().toUpperCase(Locale.ROOT), d);
+                    }
+                } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
+                    done.countDown();
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(BluetoothDevice.ACTION_FOUND);
+        filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
+        registerBtReceiver(ctx, receiver, filter);
+        try {
+            try { adapter.cancelDiscovery(); } catch (Throwable ignored) {}
+            if (!adapter.startDiscovery()) {
+                Log.w(TAG, "Bluetooth startDiscovery returned false — using bonded devices only");
+                done.countDown();
+            }
+            done.await(10, TimeUnit.SECONDS);
+        } finally {
+            try { adapter.cancelDiscovery(); } catch (Throwable ignored) {}
+            try { ctx.unregisterReceiver(receiver); } catch (Throwable ignored) {}
+        }
+
+        for (BluetoothDevice d : found.values()) {
+            String name = safeBtName(d);
+            String mac = d.getAddress();
+            boolean bonded = false;
+            try { bonded = d.getBondState() == BluetoothDevice.BOND_BONDED; } catch (Throwable ignored) {}
+            JSONArray bucket = looksLikePrinter(d, name) ? printerLike : others;
+            putBtDevice(bucket, seen, "xprinter", "classic", mac, name, mac, bonded);
+        }
+        JSONArray chosen = printerLike.length() > 0 ? printerLike : others;
+        for (int i = 0; i < chosen.length(); i++) out.put(chosen.get(i));
+    }
+
+    @SuppressWarnings("deprecation")
+    private static BluetoothDevice bluetoothDeviceExtra(Intent intent) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            return intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+        }
+        return intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+    }
+
+    private void appendEpsonBluetoothDevices(Context ctx, JSONArray out) {
+        Set<String> seen = new HashSet<>();
+        collectEpsonDiscovery(ctx, Discovery.PORTTYPE_BLUETOOTH, "classic", out, seen);
+        collectEpsonDiscovery(ctx, Discovery.PORTTYPE_BLUETOOTH_LE, "ble", out, seen);
+    }
+
+    private void collectEpsonDiscovery(Context ctx, int portType, String transport, JSONArray out, Set<String> seen) {
+        final JSONArray found = new JSONArray();
+        DiscoveryListener listener = deviceInfo -> {
+            if (deviceInfo == null) return;
+            try {
+                String target = deviceInfo.getTarget();
+                String name = deviceInfo.getDeviceName();
+                String mac = deviceInfo.getMacAddress();
+                if ((mac == null || mac.isEmpty()) && "ble".equals(transport)) {
+                    mac = deviceInfo.getLeBdAddress();
+                }
+                if (mac == null || mac.isEmpty()) mac = deviceInfo.getBdAddress();
+                synchronized (found) {
+                    putBtDevice(found, seen, "epson", transport,
+                            target != null && !target.isEmpty() ? target : mac,
+                            name, mac, false);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Epson BT discovery row: " + e.getMessage());
+            }
+        };
+        FilterOption opt = new FilterOption();
+        opt.setPortType(portType);
+        opt.setDeviceType(Discovery.TYPE_PRINTER);
+        opt.setEpsonFilter(Discovery.FILTER_NAME);
+        if (portType == Discovery.PORTTYPE_BLUETOOTH) {
+            opt.setBondedDevices(Discovery.TRUE);
+        }
+        try {
+            try { Discovery.stop(); } catch (Throwable ignored) {}
+            Discovery.start(ctx, opt, listener);
+            Thread.sleep(6000);
+        } catch (Exception e) {
+            Log.w(TAG, "Epson BT discovery (" + transport + "): " + e.getMessage());
+        } finally {
+            try { Discovery.stop(); } catch (Throwable ignored) {}
+        }
+        synchronized (found) {
+            for (int i = 0; i < found.length(); i++) out.put(found.opt(i));
+        }
+    }
+
+    private String epsonBluetoothTarget(String target, String transport) {
+        String t = target == null ? "" : target.trim();
+        String upper = t.toUpperCase(Locale.ROOT);
+        if (upper.startsWith("BT:") || upper.startsWith("BLE:") || upper.startsWith("TCP:") || upper.startsWith("USB:")) {
+            return t;
+        }
+        String mac = normalizeMac(t);
+        if ("ble".equalsIgnoreCase(transport)) return "BLE:" + mac;
+        return "BT:" + mac;
+    }
+
+    private boolean ensureXprinterBonded(Context ctx, String mac) throws Exception {
+        BluetoothAdapter adapter = bluetoothAdapter(ctx);
+        if (adapter == null || !adapter.isEnabled()) {
+            throw new Exception("Bluetooth ปิดอยู่");
+        }
+        if (!BluetoothAdapter.checkBluetoothAddress(mac)) {
+            throw new Exception("MAC Bluetooth ไม่ถูกต้อง: " + mac);
+        }
+        try { adapter.cancelDiscovery(); } catch (Throwable ignored) {}
+        BluetoothDevice device = adapter.getRemoteDevice(mac);
+        try {
+            if (device.getBondState() == BluetoothDevice.BOND_BONDED) return true;
+        } catch (SecurityException se) {
+            throw new Exception("ไม่ได้รับสิทธิ์ Bluetooth");
+        }
+        final CountDownLatch latch = new CountDownLatch(1);
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent intent) {
+                if (!BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(intent.getAction())) return;
+                BluetoothDevice d = bluetoothDeviceExtra(intent);
+                if (d == null || d.getAddress() == null || !d.getAddress().equalsIgnoreCase(mac)) return;
+                int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE);
+                if (state == BluetoothDevice.BOND_BONDED || state == BluetoothDevice.BOND_NONE) {
+                    latch.countDown();
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+        registerBtReceiver(ctx, receiver, filter);
+        try {
+            boolean started;
+            try {
+                started = device.createBond();
+            } catch (SecurityException se) {
+                throw new Exception("ไม่ได้รับสิทธิ์จับคู่ Bluetooth");
+            }
+            if (!started && device.getBondState() != BluetoothDevice.BOND_BONDING) {
+                return device.getBondState() == BluetoothDevice.BOND_BONDED;
+            }
+            latch.await(25, TimeUnit.SECONDS);
+            return device.getBondState() == BluetoothDevice.BOND_BONDED;
+        } finally {
+            try { ctx.unregisterReceiver(receiver); } catch (Throwable ignored) {}
+        }
+    }
+
+    private void printBitmapXprinterBluetooth(String target, Bitmap bmp, int widthPx, CallbackContext cb) {
+        ensurePosSdkInit();
+        IDeviceConnection conn = null;
+        try {
+            Context ctx = cordova.getActivity().getApplicationContext();
+            String mac = normalizeMac(target);
+            if (!ensureXprinterBonded(ctx, mac)) {
+                cb.error("BT_OFFLINE: จับคู่ Bluetooth ไม่สำเร็จ — จับคู่เครื่องพิมพ์ในตั้งค่า Bluetooth แล้วลองใหม่");
+                return;
+            }
+            conn = POSConnect.createDevice(POSConnect.DEVICE_TYPE_BLUETOOTH);
+            if (!conn.connectSync(mac, EMPTY_POS_LISTENER)) {
+                cb.error("BT_OFFLINE: เชื่อมต่อ Xprinter ผ่าน Bluetooth ไม่สำเร็จ");
+                return;
+            }
+            POSPrinter printer = new POSPrinter(conn);
+            printer.initializePrinter()
+                    .printBitmap(bmp, POSConst.ALIGNMENT_CENTER, widthPx)
+                    .feedLine(3)
+                    .cutHalfAndFeed(1);
+            waitForBluetoothFlush(bmp);
+            try { conn.closeSync(); } catch (Exception closeEx) {
+                Log.w(TAG, "Xprinter BT closeSync: " + closeEx.getMessage());
+            } finally {
+                conn = null;
+            }
+            cb.success("1");
+        } catch (Exception e) {
+            Log.e(TAG, "Xprinter Bluetooth print: " + e.getMessage(), e);
+            cb.error("BT_OFFLINE: Xprinter Bluetooth: " + e.getMessage());
+        } finally {
+            if (conn != null) {
+                try { conn.closeSync(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private void openCashDrawerXprinterBluetooth(String target, CallbackContext cb) {
+        ensurePosSdkInit();
+        IDeviceConnection conn = null;
+        try {
+            Context ctx = cordova.getActivity().getApplicationContext();
+            String mac = normalizeMac(target);
+            if (!ensureXprinterBonded(ctx, mac)) {
+                cb.error("BT_OFFLINE: จับคู่ Bluetooth ไม่สำเร็จ");
+                return;
+            }
+            conn = POSConnect.createDevice(POSConnect.DEVICE_TYPE_BLUETOOTH);
+            if (!conn.connectSync(mac, EMPTY_POS_LISTENER)) {
+                cb.error("BT_OFFLINE: เชื่อมต่อ Xprinter ผ่าน Bluetooth ไม่สำเร็จ");
+                return;
+            }
+            pulseXprinterCashDrawer(new POSPrinter(conn));
+            waitForBluetoothFlush(null);
+            try { conn.closeSync(); } catch (Exception ignored) {}
+            conn = null;
+            cb.success("เปิดลิ้นชักเก็บเงินสำเร็จ");
+        } catch (Exception e) {
+            Log.e(TAG, "Xprinter BT drawer: " + e.getMessage(), e);
+            cb.error("เปิดลิ้นชักไม่สำเร็จ: " + e.getMessage());
+        } finally {
+            if (conn != null) {
+                try { conn.closeSync(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private void printBitmapEpsonBluetooth(String target, Bitmap bmp, int widthPx,
+                                           String modelStr, String transport, CallbackContext cb) {
+        Context appCtx = getAppCtxForEpson();
+        if (appCtx == null) {
+            cb.error("Epson Bluetooth: ไม่พบ Application context");
+            return;
+        }
+        Printer printer = null;
+        try {
+            int series = epsonModelFromString(modelStr);
+            String tgt = epsonBluetoothTarget(target, transport);
+            printer = new Printer(series, Printer.MODEL_ANK, appCtx);
+            printer.connect(tgt, 20000);
+            try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+            printer.beginTransaction();
+            printer.addTextAlign(Printer.ALIGN_CENTER);
+            printer.addImage(
+                    bmp, 0, 0, bmp.getWidth(), bmp.getHeight(),
+                    Printer.COLOR_1, Printer.MODE_MONO, Printer.HALFTONE_THRESHOLD,
+                    Printer.PARAM_DEFAULT, Printer.COMPRESS_AUTO);
+            printer.addFeedLine(3);
+            printer.addCut(Printer.CUT_FEED);
+            printer.sendData(Printer.PARAM_DEFAULT);
+            sleepQuiet(200);
+            try { printer.endTransaction(); } catch (Exception e) {
+                Log.w(TAG, "Epson BT endTransaction: " + e.getMessage());
+            }
+            cb.success("1");
+        } catch (Epos2Exception e) {
+            Log.e(TAG, "Epson BT print code=" + e.getErrorStatus(), e);
+            cb.error("BT_OFFLINE: Epson Bluetooth print error: code=" + e.getErrorStatus());
+        } catch (Exception e) {
+            Log.e(TAG, "Epson BT print: " + e.getMessage(), e);
+            cb.error("BT_OFFLINE: Epson Bluetooth: " + e.getMessage());
+        } finally {
+            if (printer != null) {
+                try { printer.disconnect(); } catch (Exception ignored) {}
+                try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private void openCashDrawerEpsonBluetooth(String target, String modelStr, String transport, CallbackContext cb) {
+        Context appCtx = getAppCtxForEpson();
+        if (appCtx == null) {
+            cb.error("Epson Bluetooth: ไม่พบ Application context");
+            return;
+        }
+        Printer printer = null;
+        try {
+            int series = epsonModelFromString(modelStr);
+            String tgt = epsonBluetoothTarget(target, transport);
+            printer = new Printer(series, Printer.MODEL_ANK, appCtx);
+            printer.connect(tgt, 20000);
+            try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+            printer.beginTransaction();
+            printer.addPulse(Printer.DRAWER_2PIN, Printer.PULSE_100);
+            try { printer.addPulse(Printer.DRAWER_5PIN, Printer.PULSE_100); } catch (Throwable ignored) {}
+            printer.sendData(Printer.PARAM_DEFAULT);
+            sleepQuiet(120);
+            try { printer.endTransaction(); } catch (Exception ignored) {}
+            cb.success("เปิดลิ้นชักเก็บเงินสำเร็จ");
+        } catch (Epos2Exception e) {
+            Log.e(TAG, "Epson BT drawer code=" + e.getErrorStatus(), e);
+            cb.error("Epson Bluetooth drawer error: code=" + e.getErrorStatus());
+        } catch (Exception e) {
+            cb.error("เปิดลิ้นชักไม่สำเร็จ: " + e.getMessage());
+        } finally {
+            if (printer != null) {
+                try { printer.disconnect(); } catch (Exception ignored) {}
+                try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    /**
+     * เช็คว่าเครื่องที่บันทึกไว้กลับมาแล้ว โดยต่อแล้วปิดทันที ไม่พิมพ์และไม่เด้งหน้าจับคู่
+     */
+    private void probeBluetoothPrinter(
+            String brand, String target, String modelStr, String transport, CallbackContext cb) {
+        if (target == null || target.trim().isEmpty()) {
+            cb.error("BT_OFFLINE: ไม่มีที่อยู่ Bluetooth");
+            return;
+        }
+        final String b = brand == null ? "" : brand.toLowerCase(Locale.ROOT);
+        final String lockKey = "bt:" + target;
+        cordova.getThreadPool().execute(() -> {
+            synchronized (printerLocks.computeIfAbsent(lockKey, k -> new Object())) {
+                try {
+                    if (!ensureBluetoothPermissionBlocking()) {
+                        cb.error("BT_OFFLINE: ไม่ได้รับสิทธิ์ Bluetooth");
+                        return;
+                    }
+                    Context ctx = cordova.getActivity() != null
+                            ? cordova.getActivity().getApplicationContext()
+                            : cordova.getContext();
+                    BluetoothAdapter adapter = ctx == null ? null : bluetoothAdapter(ctx);
+                    if (adapter == null || !adapter.isEnabled()) {
+                        cb.error("BT_OFFLINE: Bluetooth ปิดอยู่");
+                        return;
+                    }
+                    boolean online = "epson".equals(b)
+                            ? probeEpsonBluetooth(target, modelStr, transport)
+                            : probeXprinterBluetooth(ctx, normalizeMac(target));
+                    if (online) cb.success("1");
+                    else cb.error("BT_OFFLINE: เครื่องพิมพ์ยังไม่พร้อม");
+                } catch (Exception e) {
+                    cb.error("BT_OFFLINE: " + e.getMessage());
+                }
+            }
+        });
+    }
+
+    /** ต่อเฉพาะเครื่องที่จับคู่ไว้แล้ว ถ้าเครื่องดับ connectSync จะไม่ผ่าน */
+    private boolean probeXprinterBluetooth(Context ctx, String mac) {
+        if (ctx == null || !BluetoothAdapter.checkBluetoothAddress(mac)) return false;
+        BluetoothAdapter adapter = bluetoothAdapter(ctx);
+        if (adapter == null) return false;
+        try { adapter.cancelDiscovery(); } catch (Throwable ignored) {}
+        BluetoothDevice device = adapter.getRemoteDevice(mac);
+        try {
+            if (device.getBondState() != BluetoothDevice.BOND_BONDED) return false;
+        } catch (SecurityException se) {
+            return false;
+        }
+        ensurePosSdkInit();
+        IDeviceConnection conn = null;
+        try {
+            conn = POSConnect.createDevice(POSConnect.DEVICE_TYPE_BLUETOOTH);
+            return conn.connectSync(mac, EMPTY_POS_LISTENER);
+        } catch (Exception e) {
+            Log.d(TAG, "Xprinter BT probe: " + e.getMessage());
+            return false;
+        } finally {
+            if (conn != null) {
+                try { conn.closeSync(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private boolean probeEpsonBluetooth(String target, String modelStr, String transport) {
+        Context appCtx = getAppCtxForEpson();
+        if (appCtx == null) return false;
+        Printer printer = null;
+        try {
+            int series = epsonModelFromString(modelStr);
+            String tgt = epsonBluetoothTarget(target, transport);
+            printer = new Printer(series, Printer.MODEL_ANK, appCtx);
+            printer.connect(tgt, 5000);
+            return true;
+        } catch (Exception e) {
+            Log.d(TAG, "Epson BT probe: " + e.getMessage());
+            return false;
+        } finally {
+            if (printer != null) {
+                try { printer.disconnect(); } catch (Exception ignored) {}
+                try { printer.clearCommandBuffer(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    /** รอให้รูปเดินทางออกทาง Bluetooth ก่อนปิดซ็อกเก็ต — ช้ากว่า USB/LAN */
+    private static void waitForBluetoothFlush(Bitmap bmp) {
+        int pixels = (bmp == null) ? 80_000 : Math.max(1, bmp.getWidth() * bmp.getHeight());
+        int ms = Math.min(15000, Math.max(1500, pixels / 80));
+        sleepQuiet(ms);
     }
 }
